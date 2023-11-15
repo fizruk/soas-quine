@@ -1,0 +1,10 @@
+cradle:
+  stack:
+    - path: "soas-quine/src"
+      component: "soas-quine:lib"
+
+    - path: "soas-quine/app/Main.hs"
+      component: "soas-quine:exe:soas-quine-exe"
+
+    - path: "soas-quine/test"
+      component: "soas-quine:test:soas-quine-test"
