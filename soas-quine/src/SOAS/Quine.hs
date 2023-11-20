@@ -1,4 +1,5 @@
 {-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -7,18 +8,22 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE FlexibleInstances #-}
 module SOAS.Quine where
 
-import Data.Bifunctor
+import Data.Bifunctor ( Bifunctor(first, bimap) )
 
-import Control.Monad
+import Control.Monad ( (>=>) )
 import Free.Scoped
-import Free.Scoped.TH
+    ( traverseFS, type (:+:), FS(..), Inc(..), Sum(InL, InR) )
+import Free.Scoped.TH ( makePatternsAll )
 import Data.Bifunctor.TH
-import Data.Void
-import Data.Bitraversable
-import Data.Bifoldable
-import Data.Maybe (mapMaybe)
+    ( deriveBifoldable, deriveBifunctor, deriveBitraversable )
+import Data.Void ( Void, absurd )
+import Data.Bitraversable ( Bitraversable(..) )
+import Data.Bifoldable ( Bifoldable(bifold) )
+import Data.Maybe (mapMaybe, maybeToList)
+import Data.List (intercalate)
 
 -- * SOAS
 
@@ -60,7 +65,7 @@ applyMetaSubst substs = \case
     case lookup m (getMetaSubsts substs) of
       Nothing -> error "undefined metavariable!"
       Just body -> body >>= f (map (applyMetaSubst substs) args)
-  t@(Free (InL op)) -> Free (InL (bimap (applyMetaSubst (fmap S substs)) (applyMetaSubst substs) op))
+  Free (InL op) -> Free (InL (bimap (applyMetaSubst (fmap S substs)) (applyMetaSubst substs) op))
   where
     f args (BoundVar i) = args !! i
     f _args (FreeVar x) = Pure x
@@ -101,15 +106,62 @@ closed2 = traverse (const Nothing) >=> traverseFS f
 closedSubst :: Bitraversable sig => MetaSubst sig metavar metavar' (Inc var) -> Maybe (MetaSubst sig metavar metavar' var)
 closedSubst = traverse (const Nothing)
 
--- \ z. M []   `match`   \z. z    M[] := z INVALID
+-- >>> matchMetaVar [AppE (Var "A") (M "N" [Var "B"]), Var "C"] [] (Var "C")
+-- [(Pure (BoundVar 1),MetaSubst {getMetaSubsts = []})]
+--
+-- M[A,B,A N[B],C] =?= Π (x : A B), C x
+-- 1) M[a1,a2,a3,a4] := Π (x : a3), a4 x
+--    N[a1] := a1
+-- 2) M[a1,a2,a3,a4] := Π (x : a1 a2), a4 x
+-- >>> matchMetaVar [Var "A", Var "B", AppE (Var "A") (M "N" [Var "B"]), Var "C"] [] (PiE (AppE (Var "A") (Var "B")) (AppE (Var (S "C")) (Var Z)))
+-- [(Free (InL (PiF (Pure (BoundVar 2)) (Free (InL (AppF (Pure (S (BoundVar 3))) (Pure Z)))))),MetaSubst {getMetaSubsts = [("N",Pure (BoundVar 0))]}),(Free (InL (PiF (Free (InL (AppF (Pure (BoundVar 0)) (Pure (BoundVar 1))))) (Free (InL (AppF (Pure (S (BoundVar 3))) (Pure Z)))))),MetaSubst {getMetaSubsts = []})]
+-- >>> matchMetaVar [AppE (Var "A") (M "N" [Var "B"]), Var "C"] [] (AppE (Var "A") (Var "B"))
+-- [(Pure (BoundVar 0),MetaSubst {getMetaSubsts = [("N",Pure (BoundVar 0))]})]
+matchMetaVar
+  :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
+  => [SOAS sig metavar var]
+  -> [var]
+  -> SOAS sig metavar' var
+  -> [(SOAS sig metavar' (IncMany var), MetaSubst sig metavar metavar' var)]
+matchMetaVar args boundVars rhs = projections ++ projectionsBoundVars ++ imitations
+  where
+    projections =
+      [ (Pure (BoundVar i), subst)
+      | (i, arg) <- zip [0..] args
+      , subst <- match arg rhs
+      ]
+    projectionsBoundVars =
+      [ (Pure (FreeVar boundVar), subst)
+      | boundVar <- boundVars
+      , subst <- match (Pure boundVar) rhs
+      ]
 
--- f = \ x . f x
--- \ z . M[] z  =  M[]
+    k :: IncMany (Inc a) -> Inc (IncMany a)
+    k (BoundVar i) = S (BoundVar i)
+    k (FreeVar Z) = Z
+    k (FreeVar (S x)) = S (FreeVar x)
 
--- M[x, x]  `match`  x       M[x1,x2] := x1  OR  M[x1,x2] := x2
+    imitations =
+      [ (Free (InL (first (fmap k) body)), subst)
+      | Free (InL opR) <- [rhs]     -- M[A + N[B], C] =?= Π (x : A + B), C x
+                                    -- M[X,Y] := Π (x : X), Y x
+      , opR' :: sig (SOAS sig metavar' (IncMany (Inc var)), MetaSubst sig metavar metavar' (Inc var))
+                    (SOAS sig metavar' (IncMany var), MetaSubst sig metavar metavar' var)
+          <- bitraverse (matchMetaVar (fmap (fmap S) args) (Z : fmap S boundVars)) (matchMetaVar args boundVars) opR
+      -- opR' = Π (x : (Bound 1, [N[B] := B])), (AppE (S (Bound 2)) Z, [])
+      , let body = bimap fst fst opR'
+      , op' <- bitraverse (maybeToList . closedSubst . snd) (pure . snd) opR'
+      , let subst = bifold op'
+      ]
 
 -- Current assumptions/limitations:
 -- * LHS (pattern) has distinct metavariables (no duplicate names)
+--
+-- >>> lhs :==: _rhs = beta
+-- >>> match lhs (AppE (LamE (Pure Z)) two) :: [MetaSubst LambdaF String String String]
+-- [MetaSubst {getMetaSubsts = [("M",Pure (BoundVar 0)),("N",Free (InL (LamF (Free (InL (LamF (Free (InL (AppF (Pure (S Z)) (Free (InL (AppF (Pure (S Z)) (Pure Z)))))))))))))]}]
+-- >>> match lhs (AppE two two)
+-- [MetaSubst {getMetaSubsts = [("M",Free (InL (LamF (Free (InL (AppF (Pure (S (BoundVar 0))) (Free (InL (AppF (Pure (S (BoundVar 0))) (Pure Z)))))))))),("N",Free (InL (LamF (Free (InL (LamF (Free (InL (AppF (Pure (S Z)) (Free (InL (AppF (Pure (S Z)) (Pure Z)))))))))))))]}]
 match
   :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
   => SOAS sig metavar var
@@ -119,12 +171,11 @@ match lhs rhs =
   case lhs of
     Free (InR (MetaVarF m []))
       | Just rhs' <- closed2 rhs
-      -> return (MetaSubst [(m, absurd <$> rhs')])
+      -> return (MetaSubst [(m, absurd <$> rhs')])    -- projection
 
     Free (InR (MetaVarF m args)) ->
-      [ MetaSubst ((m, Pure (BoundVar i)) : subst)
-      | (i, arg) <- zip [0..] args
-      , MetaSubst subst <- match arg rhs
+      [ MetaSubst [(m, body)] <> subst
+      | (body, subst) <- matchMetaVar args [] rhs
       ]
 
     Free (InL opL) ->
@@ -151,6 +202,7 @@ match lhs rhs =
 data LambdaF scope term
   = AppF term term
   | LamF scope
+  | PiF term scope
   deriving (Eq, Show, Functor, Foldable, Traversable)
 deriveBifunctor ''LambdaF
 deriveBifoldable ''LambdaF
@@ -161,6 +213,34 @@ pattern Var x = Pure x
 
 type Lambda = FS LambdaF
 type LambdaE metavar var = SOAS LambdaF metavar var
+
+instance {-# OVERLAPPING #-} Show var => Show (LambdaE String var) where
+  show = ppLambdaE defaultVars . fmap show
+    where
+      defaultVars = [ "x" <> show n | n <- [1..] ]
+
+instance {-# OVERLAPPING #-} Show var => Show (MetaSubst LambdaF String String var) where
+  show (MetaSubst substs) = show substs
+
+ppLambdaE :: [String] -> LambdaE String String -> String
+ppLambdaE = go id
+  where
+    go :: (var -> String) -> [String] -> LambdaE String var -> String
+    go varName freshVars = \case
+      Pure x -> varName x
+      Free (InR (MetaVarF m args)) -> m ++ "[" ++ intercalate "," (map (go varName freshVars) args) ++  "]"
+      Free (InL (AppF fun arg)) -> "(" ++ go varName freshVars fun ++ ") " ++ go varName freshVars arg
+      Free (InL (LamF body)) -> withScope $ \ z zs varName' ->
+        "λ " ++ z ++ " . " ++ go varName' zs body
+      Free (InL (PiF a b)) -> withScope $ \ z zs varName' ->
+        "Π (" ++ z ++ " : " ++ go varName freshVars a ++ "), " ++ go varName' zs b
+      where
+        withScope f = case freshVars of
+          [] -> error "not enough fresh variables"
+          z:zs ->
+            let varName' Z = z
+                varName' (S x) = varName x
+            in f z zs varName'
 
 two :: SOAS LambdaF metavar var
 two = LamE (LamE (AppE s (AppE s z)))
