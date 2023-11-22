@@ -9,6 +9,7 @@
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
 module SOAS.Quine where
 
 import Data.Bifunctor ( Bifunctor(first, bimap) )
@@ -102,8 +103,8 @@ instance ZipMatch LambdaF where
 
 -- * Matching
 
--- type Matchable sig = (ZipMatch sig, Bitraversable sig, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
--- type Matchable sig = (ZipMatch sig, Bitraversable sig, Eq2 sig)
+class (ZipMatch sig, Bitraversable sig, forall scope term. (Eq scope, Eq term) => Eq (sig scope term)) => Matchable sig
+instance (ZipMatch sig, Bitraversable sig, forall scope term. (Eq scope, Eq term) => Eq (sig scope term)) => Matchable sig
 
 closed :: Bitraversable sig => SOAS sig metavar var -> Maybe (SOAS sig metavar Void)
 closed = traverse (const Nothing)
@@ -129,7 +130,7 @@ closedSubst = traverse (const Nothing)
 -- >>> matchMetaVar [AppE (Var "A") (M "N" [Var "B"]), Var "C"] [] (AppE (Var "A") (Var "B"))
 -- [(Pure (BoundVar 0),MetaSubst {getMetaSubsts = [("N",Pure (BoundVar 0))]})]
 matchMetaVar
-  :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
+  :: (Matchable sig, Eq metavar, Eq var)
   => [SOAS sig metavar var]
   -> [var]
   -> SOAS sig metavar' var
@@ -220,6 +221,7 @@ deriveBifoldable ''LambdaF
 deriveBitraversable ''LambdaF
 makePatternsAll ''LambdaF
 
+pattern Var :: var -> FS sig var
 pattern Var x = Pure x
 
 type Lambda = FS LambdaF
@@ -278,7 +280,7 @@ exSubst = MetaSubst
   ]
 
 applyRule
-  :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
+  :: (Matchable sig, Eq metavar, Eq var)
   => Equation sig metavar var
   -> SOAS sig metavar' var
   -> [SOAS sig metavar' var]
@@ -287,7 +289,7 @@ applyRule (lhs :==: rhs) term = do
   return (applyMetaSubst subst rhs)
 
 applyRuleSomewhere
-  :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
+  :: (Matchable sig, Eq metavar, Eq var)
   => Equation sig metavar var
   -> SOAS sig metavar' var
   -> [SOAS sig metavar' var]
@@ -306,7 +308,7 @@ applyRuleSomewhere (lhs :==: rhs) term = do
     k (InR (MetaVarF m args)) = InR (MetaVarF (S m) args)
 
 whnfFromRules
-  :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
+  :: (Matchable sig, Eq metavar, Eq var)
   => [Equation sig metavar var]
   -> SOAS sig metavar' var
   -> [SOAS sig metavar' var]
@@ -321,7 +323,7 @@ whnfFromRules rules term
       ]
 
 whnfChainFromRules
-  :: (ZipMatch sig, Bitraversable sig, Eq metavar, Eq var, forall scope term. (Eq scope, Eq term) => Eq (sig scope term))
+  :: (Matchable sig, Eq metavar, Eq var)
   => [Equation sig metavar var]
   -> SOAS sig metavar' var
   -> [[SOAS sig metavar' var]]
