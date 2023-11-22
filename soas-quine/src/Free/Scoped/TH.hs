@@ -19,8 +19,15 @@ makePatternsAll :: Name -> Q [Dec]
 makePatternsAll ty = do
   TyConI tyCon <- reify ty
   case tyCon of
-    DataD _ _ _ _ cs _ -> concat <$> do
-      xs <- mapM makePatternFor cs
+    DataD _ tyName typeParams _ cs _ -> concat <$> do
+      let typeParamName = \case
+            PlainTV name _ -> name
+            KindedTV name _ _ -> name
+      var <- newName "var"
+      let [scope, term] = map typeParamName (reverse (take 2 (reverse typeParams)))
+          paramNames = map typeParamName (reverse (drop 2 (reverse typeParams)))
+          ast = AppT (ConT ''FS) (foldl AppT (ConT tyName) (fmap VarT paramNames))
+      xs <- mapM (makePatternFor ast scope term var) cs
       xs' <- makeCompletePragma cs
       ys <- mapM makePatternEFor cs
       ys' <- makeCompletePragmaE cs
@@ -66,18 +73,28 @@ makeCompletePragmaTE cs = do
   where
     removeF s = take (length s - 1) s <> "TE"
 
-makePatternFor :: Con -> Q [Dec]
-makePatternFor = \case
+makePatternFor :: Type -> Name -> Name -> Name -> Con -> Q [Dec]
+makePatternFor ast scope term var = \case
   NormalC name xs -> do
     args <- replicateM (length xs) (newName "x")
+    let patArgTypes = map (toPatArgType var . snd) xs
     let patName = mkName (removeF (nameBase name))
         patArgs = PrefixPatSyn args
         dir = ImplBidir
     pat <- [p| Free $(pure (mkConP name (VarP <$> args))) |]
-    return [PatSynD patName patArgs dir pat]
+    return
+      [ PatSynSigD patName (foldr (AppT . AppT ArrowT) (AppT ast (VarT var)) patArgTypes)
+      , PatSynD patName patArgs dir pat
+      ]
   _ -> fail "Can only make patterns for NormalC constructors"
   where
     removeF s = take (length s - 1) s
+
+    toPatArgType var = \case
+      VarT name
+        | name == scope -> AppT ast (AppT (ConT ''Inc) (VarT var))
+        | name == term  -> AppT ast (VarT var)
+      t -> t
 
 makePatternEFor :: Con -> Q [Dec]
 makePatternEFor = \case
