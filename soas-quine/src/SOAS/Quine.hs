@@ -1,4 +1,5 @@
 {-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
 {-# LANGUAGE TypeOperators #-}
@@ -11,9 +12,11 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ParallelListComp #-}
 module SOAS.Quine where
 
 import Data.Bifunctor ( Bifunctor(first, bimap) )
+import Data.Bifoldable ( Bifoldable(bifoldMap, bifold) )
 
 import Control.Monad ( (>=>), guard )
 import Free.Scoped
@@ -23,9 +26,8 @@ import Data.Bifunctor.TH
     ( deriveBifoldable, deriveBifunctor, deriveBitraversable )
 import Data.Void ( Void, absurd )
 import Data.Bitraversable ( Bitraversable(..) )
-import Data.Bifoldable ( Bifoldable(bifold) )
 import Data.Maybe (mapMaybe, maybeToList)
-import Data.List (intercalate)
+import Data.List (intercalate, tails, inits)
 
 -- * SOAS
 
@@ -68,14 +70,14 @@ deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term)
 deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar, Show metavar') => Show (MetaSubst sig metavar metavar' var)
 
 applyMetaSubst :: (Eq metavar, Bifunctor sig)
-  => MetaSubst sig metavar metavar' var -> SOAS sig metavar var -> SOAS sig metavar' var
-applyMetaSubst substs = \case
+  => (metavar -> metavar') -> MetaSubst sig metavar metavar' var -> SOAS sig metavar var -> SOAS sig metavar' var
+applyMetaSubst rename substs = \case
   Pure x -> Pure x
   Free (InR (MetaVarF m args)) ->
     case lookup m (getMetaSubsts substs) of
-      Nothing -> error "undefined metavariable!"
-      Just body -> body >>= f (map (applyMetaSubst substs) args)
-  Free (InL op) -> Free (InL (bimap (applyMetaSubst (fmap S substs)) (applyMetaSubst substs) op))
+      Nothing -> Free (InR (MetaVarF (rename m) (map (applyMetaSubst rename substs) args)))
+      Just body -> body >>= f (map (applyMetaSubst rename substs) args)
+  Free (InL op) -> Free (InL (bimap (applyMetaSubst rename (fmap S substs)) (applyMetaSubst rename substs) op))
   where
     f args (BoundVar i) = args !! i
     f _args (FreeVar x) = Pure x
@@ -83,16 +85,19 @@ applyMetaSubst substs = \case
 -- >>> applyMetaSubstEquation exSubst beta
 -- Free (InL (AppF (Free (InL (LamF (Free (InL (LamF (Free (InL (AppF (Pure (S Z)) (Free (InL (AppF (Pure (S Z)) (Pure Z))))))))))))) (Pure "f"))) :==: Free (InL (LamF (Free (InL (AppF (Pure (S "f")) (Free (InL (AppF (Pure (S "f")) (Pure Z)))))))))
 applyMetaSubstEquation :: (Eq metavar, Bifunctor sig)
-  => MetaSubst sig metavar metavar' var -> Equation sig metavar var -> Equation sig metavar' var
-applyMetaSubstEquation substs (x :==: y) = x' :==: y'
+  => (metavar -> metavar') -> MetaSubst sig metavar metavar' var -> Equation sig metavar var -> Equation sig metavar' var
+applyMetaSubstEquation rename substs (x :==: y) = x' :==: y'
   where
-    x' = applyMetaSubst substs x
-    y' = applyMetaSubst substs y
+    x' = applyMetaSubst rename substs x
+    y' = applyMetaSubst rename substs y
 
 applyMetaSubstConstraint :: (Eq metavar, Bifunctor sig)
-  => MetaSubst sig metavar metavar' (IncMany var) -> Constraint sig metavar var -> Constraint sig metavar' var
-applyMetaSubstConstraint subst Constraint{..} = Constraint
-  { constraintEq = applyMetaSubstEquation subst constraintEq
+  => (metavar -> metavar')
+  -> MetaSubst sig metavar metavar' (IncMany var)
+  -> Constraint sig metavar var
+  -> Constraint sig metavar' var
+applyMetaSubstConstraint rename subst Constraint{..} = Constraint
+  { constraintEq = applyMetaSubstEquation rename subst constraintEq
   , .. }
 
 -- * Zip-match
@@ -100,6 +105,16 @@ applyMetaSubstConstraint subst Constraint{..} = Constraint
 class ZipMatch sig where
   zipMatch
     :: sig scope term -> sig scope' term' -> Maybe (sig (scope, scope') (term, term'))
+
+instance (ZipMatch f, ZipMatch g) => ZipMatch (Sum f g) where
+  zipMatch (InL x) (InL y) = InL <$> zipMatch x y
+  zipMatch (InR x) (InR y) = InR <$> zipMatch x y
+  zipMatch _ _ = Nothing
+
+instance Eq metavar => ZipMatch (MetaF metavar) where
+  zipMatch (MetaVarF x xs) (MetaVarF y ys)
+    | x == y = Just (MetaVarF x (zip xs ys))
+    | otherwise = Nothing
 
 instance ZipMatch LambdaF where
   zipMatch (AppF fun1 arg1) (AppF fun2 arg2)
@@ -235,7 +250,7 @@ applyRule
   -> [SOAS sig metavar' var]
 applyRule (lhs :==: rhs) term = do
   subst <- match lhs term
-  return (applyMetaSubst subst rhs)
+  return (applyMetaSubst (error "impossible happened!") subst rhs)
 
 applyRuleSomewhere
   :: (Matchable sig, Eq metavar, Eq var)
@@ -247,7 +262,7 @@ applyRuleSomewhere (lhs :==: rhs) term = do
   Just n <- [sum . fmap countBoundVar <$> lookup Z (getMetaSubsts subst)]
   guard (n == 1) -- we use only applications with exactly one rule application (redex)
   -- guard (n > 0)  -- we could instead ask for at least one rule application (redex)
-  return (applyMetaSubst subst rhs')
+  return (applyMetaSubst (error "impossible happened!") subst rhs')
   where
     countBoundVar BoundVar{} = 1
     countBoundVar _ = 0
@@ -321,6 +336,70 @@ data Constraint' sig metavar var
 
 type UnificationProblem sig metavar var
   = [Constraint sig metavar var]
+
+type TransitionRule sig metavar var
+  = (Matchable sig, Eq metavar, Eq var)
+  => Constraint sig metavar var
+  -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
+
+delete :: TransitionRule sig metavar var
+delete Constraint{constraintEq = lhs :==: rhs}
+  | lhs == rhs = [(mempty, [])]
+delete _ = []
+
+decompose :: TransitionRule sig metavar var
+decompose Constraint{constraintEq = Pure x :==: Pure y}
+  | x == y = [(mempty, [])]
+decompose Constraint{constraintEq = Free lhs :==: Free rhs, ..} =
+  case zipMatch lhs rhs of
+    Nothing -> []
+    Just t -> [(mempty, bifoldMap mkConstraintScope mkConstraint t)]
+  where
+    mkConstraint (l, r) =
+      [Constraint{constraintEq = l :==: r, ..}]
+    mkConstraintScope (l, r) =
+      [Constraint{constraintEq = l' :==: r', constraintScope = 1 + constraintScope}]
+      where
+        l' = fmap k l
+        r' = fmap k r
+        -- turn local variable into a new constraint forall variable
+        k Z = BoundVar constraintScope
+        k (S x) = x
+decompose _ = []
+
+projectImitate :: TransitionRule sig metavar var
+projectImitate Constraint{constraintEq = M m args :==: rhs} =
+  [ (MetaSubst [(m, substBody')] <> subst', [])
+  | (substBody, subst) <- matchMetaVar args [] rhs
+  , substBody' <- traverse (traverse onlyFreeVar) substBody
+  , subst' <- traverse onlyFreeVar subst
+  ]
+projectImitate _ = []
+
+onlyFreeVar :: IncMany var -> [var]
+onlyFreeVar (FreeVar x) = [x]
+onlyFreeVar BoundVar{} = []
+
+choose :: [a] -> [(a, [a])]
+choose xs =
+  [ (y, before ++ after)
+  | y:after <- tails xs
+  | before <- inits xs
+  ]
+
+preunify
+  :: (Matchable sig, Eq metavar, Eq var)
+  => [Equation sig metavar var]
+  -> UnificationProblem sig metavar var
+  -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
+preunify _ [] = [(mempty, [])]
+preunify rules constraints =
+  [ (subst <> finalSubst, unsolvedConstraints)
+  | (constraint, otherConstraints) <- choose constraints
+  , (subst, newConstraints) <- (decompose <> projectImitate) constraint
+  , (finalSubst, unsolvedConstraints) <-
+      preunify rules (newConstraints ++ map (applyMetaSubstConstraint id (fmap FreeVar subst)) otherConstraints)
+  ]
 
 -- mutate :: (Matchable sig, Eq var, Eq metavar)
 --   => [Equation sig metavar Void] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
@@ -434,6 +513,6 @@ checkExample10 :: Bool
 checkExample10 = and
   [ lhs == (rhs :: SOAS LambdaF String (IncMany String))
   | constraint <- example10
-  , let constraint' = applyMetaSubstConstraint solution10 constraint
+  , let constraint' = applyMetaSubstConstraint id solution10 constraint
   , lhs :==: rhs <- constraintEq <$> whnfFromRulesConstraint [beta] constraint'
   ]
