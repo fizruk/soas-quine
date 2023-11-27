@@ -9,6 +9,7 @@
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeOperators         #-}
 {-# LANGUAGE UndecidableInstances  #-}
+{-# OPTIONS_GHC -Wno-missing-export-lists #-}
 module Free.Scoped where
 
 import           Control.Monad      (ap)

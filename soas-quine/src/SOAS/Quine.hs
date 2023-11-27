@@ -10,6 +10,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
+{-# LANGUAGE RecordWildCards #-}
 module SOAS.Quine where
 
 import Data.Bifunctor ( Bifunctor(first, bimap) )
@@ -87,6 +88,12 @@ applyMetaSubstEquation substs (x :==: y) = x' :==: y'
   where
     x' = applyMetaSubst substs x
     y' = applyMetaSubst substs y
+
+applyMetaSubstConstraint :: (Eq metavar, Bifunctor sig)
+  => MetaSubst sig metavar metavar' (IncMany var) -> Constraint sig metavar var -> Constraint sig metavar' var
+applyMetaSubstConstraint subst Constraint{..} = Constraint
+  { constraintEq = applyMetaSubstEquation subst constraintEq
+  , .. }
 
 -- * Zip-match
 
@@ -205,9 +212,135 @@ match lhs rhs =
         Pure y | x == y -> return (MetaSubst [])
         _ -> []
 
+addVarArgs :: Bifunctor sig => [var] -> SOAS sig metavar var -> SOAS sig metavar var
+addVarArgs vars = \case
+  Pure x -> Pure x
+  Free (InL op) ->
+    Free (InL (bimap (addVarArgs (map S vars)) (addVarArgs vars) op))
+  Free (InR (MetaVarF m args)) ->
+    Free (InR (MetaVarF m (map Pure vars ++ map (addVarArgs vars) args)))
+
+addVarArgsEquation :: Bifunctor sig => [var] -> Equation sig metavar var -> Equation sig metavar var
+addVarArgsEquation vars (lhs :==: rhs) = lhs' :==: rhs'
+  where
+    lhs' = addVarArgs vars lhs
+    rhs' = addVarArgs vars rhs
+
+-- * Computing with rules
+
+applyRule
+  :: (Matchable sig, Eq metavar, Eq var)
+  => Equation sig metavar var
+  -> SOAS sig metavar' var
+  -> [SOAS sig metavar' var]
+applyRule (lhs :==: rhs) term = do
+  subst <- match lhs term
+  return (applyMetaSubst subst rhs)
+
+applyRuleSomewhere
+  :: (Matchable sig, Eq metavar, Eq var)
+  => Equation sig metavar var
+  -> SOAS sig metavar' var
+  -> [SOAS sig metavar' var]
+applyRuleSomewhere (lhs :==: rhs) term = do
+  subst <- match lhs' term
+  Just n <- [sum . fmap countBoundVar <$> lookup Z (getMetaSubsts subst)]
+  guard (n == 1) -- we use only applications with exactly one rule application (redex)
+  -- guard (n > 0)  -- we could instead ask for at least one rule application (redex)
+  return (applyMetaSubst subst rhs')
+  where
+    countBoundVar BoundVar{} = 1
+    countBoundVar _ = 0
+    lhs' = M Z [transFS k lhs]
+    rhs' = M Z [transFS k rhs]
+    k (InL l) = InL l
+    k (InR (MetaVarF m args)) = InR (MetaVarF (S m) args)
+
+whnfFromRules
+  :: (Matchable sig, Eq metavar, Eq var)
+  => [Equation sig metavar var]
+  -> SOAS sig metavar' var
+  -> [SOAS sig metavar' var]
+whnfFromRules rules term
+  | null terms' = [term]
+  | otherwise = concatMap (whnfFromRules rules) terms'
+  where
+    terms' =
+      [ term'
+      | rule <- rules
+      , term' <- applyRule rule term
+      ]
+
+whnfFromRulesConstraint
+  :: (Matchable sig, Eq metavar, Eq var)
+  => [Equation sig metavar var]
+  -> Constraint sig metavar' var
+  -> [Constraint sig metavar' var]
+whnfFromRulesConstraint rules Constraint{..} =
+  [ Constraint{ constraintEq = lhs' :==: rhs', ..}
+  | let lhs :==: rhs = constraintEq
+  , lhs' <- whnfFromRules rules' lhs
+  , rhs' <- whnfFromRules rules' rhs
+  ]
+  where
+    rules' =
+      [ addVarArgsEquation (BoundVar <$> [0 .. constraintScope - 1]) (fmap FreeVar rule)
+      | rule <- rules ]
+
+whnfChainFromRules
+  :: (Matchable sig, Eq metavar, Eq var)
+  => [Equation sig metavar var]
+  -> SOAS sig metavar' var
+  -> [[SOAS sig metavar' var]]
+whnfChainFromRules rules term
+  | null terms' = pure [term]
+  | otherwise = do
+      term' <- terms'
+      chain <- whnfChainFromRules rules term'
+      return (term : chain)
+  where
+    terms' =
+      [ term'
+      | rule <- rules
+      , term' <- applyRuleSomewhere rule term
+      ]
+
 -- * E-unification
 
+data Constraint sig metavar var = Constraint
+  { constraintEq :: Equation sig metavar (IncMany var)
+  , constraintScope :: Int
+  }
 
+deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term), Eq var, Eq metavar) => Eq (Constraint sig metavar var)
+deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Constraint sig metavar var)
+
+data Constraint' sig metavar var
+  = SOAS sig metavar var :=?=: SOAS sig metavar var
+  | ForAll (Constraint' sig metavar (Inc var))
+
+type UnificationProblem sig metavar var
+  = [Constraint sig metavar var]
+
+-- mutate :: (Matchable sig, Eq var, Eq metavar)
+--   => [Equation sig metavar Void] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
+-- mutate (lhs :==: rhs) = do
+--   rule <- rules
+--   rhs' <- applyRuleSomewhere rule lhs
+
+-- transition
+--   :: (Matchable sig, Eq var, Eq metavar)
+--   => Constraint sig metavar var
+--   -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
+-- transition = \case
+--   -- (delete)
+--   lhs :==: rhs
+--     | lhs == rhs -> [(mempty, [])]
+--   -- (decompose)
+--   Free (InL opL) :==: Free (InL opR)
+--     | Just opLR <- zipMatch opL opR -> do
+--         _ opLR
+--   _ -> []
 
 -- * Example (untyped lambda calculus)
 
@@ -279,63 +412,28 @@ exSubst = MetaSubst
   , ("N", Var (FreeVar "f"))
   ]
 
-applyRule
-  :: (Matchable sig, Eq metavar, Eq var)
-  => Equation sig metavar var
-  -> SOAS sig metavar' var
-  -> [SOAS sig metavar' var]
-applyRule (lhs :==: rhs) term = do
-  subst <- match lhs term
-  return (applyMetaSubst subst rhs)
-
-applyRuleSomewhere
-  :: (Matchable sig, Eq metavar, Eq var)
-  => Equation sig metavar var
-  -> SOAS sig metavar' var
-  -> [SOAS sig metavar' var]
-applyRuleSomewhere (lhs :==: rhs) term = do
-  subst <- match lhs' term
-  Just n <- [sum . fmap countBoundVar <$> lookup Z (getMetaSubsts subst)]
-  guard (n == 1) -- we use only applications with exactly one rule application (redex)
-  -- guard (n > 0)  -- we could instead ask for at least one rule application (redex)
-  return (applyMetaSubst subst rhs')
+example10 :: UnificationProblem LambdaF String var
+example10 = [ Constraint
+  { constraintEq = M "M" [g, f] :==: AppE g y
+  , constraintScope = 2
+  } ]
   where
-    countBoundVar BoundVar{} = 1
-    countBoundVar _ = 0
-    lhs' = M Z [transFS k lhs]
-    rhs' = M Z [transFS k rhs]
-    k (InL l) = InL l
-    k (InR (MetaVarF m args)) = InR (MetaVarF (S m) args)
+    g = Var (BoundVar 0)
+    y = Var (BoundVar 1)
+    f = LamE (AppE x (fmap S y))
+      where
+        x = Var Z
 
-whnfFromRules
-  :: (Matchable sig, Eq metavar, Eq var)
-  => [Equation sig metavar var]
-  -> SOAS sig metavar' var
-  -> [SOAS sig metavar' var]
-whnfFromRules rules term
-  | null terms' = [term]
-  | otherwise = concatMap (whnfFromRules rules) terms'
+solution10 :: MetaSubst LambdaF String metavar var
+solution10 = MetaSubst [ ("M", AppE z2 z1) ]
   where
-    terms' =
-      [ term'
-      | rule <- rules
-      , term' <- applyRuleSomewhere rule term
-      ]
+    z1 = Var (BoundVar 0)
+    z2 = Var (BoundVar 1)
 
-whnfChainFromRules
-  :: (Matchable sig, Eq metavar, Eq var)
-  => [Equation sig metavar var]
-  -> SOAS sig metavar' var
-  -> [[SOAS sig metavar' var]]
-whnfChainFromRules rules term
-  | null terms' = pure [term]
-  | otherwise = do
-      term' <- terms'
-      chain <- whnfChainFromRules rules term'
-      return (term : chain)
-  where
-    terms' =
-      [ term'
-      | rule <- rules
-      , term' <- applyRuleSomewhere rule term
-      ]
+checkExample10 :: Bool
+checkExample10 = and
+  [ lhs == (rhs :: SOAS LambdaF String (IncMany String))
+  | constraint <- example10
+  , let constraint' = applyMetaSubstConstraint solution10 constraint
+  , lhs :==: rhs <- constraintEq <$> whnfFromRulesConstraint [beta] constraint'
+  ]
