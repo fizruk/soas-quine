@@ -27,7 +27,7 @@ import Data.Bifunctor.TH
 import Data.Void ( Void, absurd )
 import Data.Bitraversable ( Bitraversable(..) )
 import Data.Maybe (mapMaybe, maybeToList)
-import Data.List (intercalate, tails, inits, nub)
+import Data.List (intercalate, tails, inits, nub, (\\))
 
 -- * SOAS
 
@@ -461,6 +461,20 @@ choose xs =
   | before <- inits xs
   ]
 
+defaultPreunify
+  :: (Matchable sig, Eq var)
+  => Int
+  -> [Equation sig String var]
+  -> UnificationProblem sig String var
+  -> [(MetaSubst sig String String var, [Constraint sig String var])]
+defaultPreunify maxDepth rules constraints = nub $
+  [ (MetaSubst (filter (isOrigMeta . fst) subst), unsolved)
+  | (MetaSubst subst, unsolved) <- preunify maxDepth defaultFreshMetaVars rules constraints
+  ]
+  where
+    isOrigMeta = (`elem` origMetas)
+    origMetas = foldMap (bifoldMap pure (const [])) constraints
+
 preunify
   :: (Matchable sig, Eq metavar, Eq var)
   => Int
@@ -475,7 +489,7 @@ preunify maxDepth freshMetaVars rules constraints =
   | (constraint, otherConstraints) <- choose constraints
   , (subst, newConstraints) <- (decompose <> projectImitate <> mutate scopeMeta freshMetaVars rules) constraint
   , (finalSubst, unsolvedConstraints) <-
-      preunify (maxDepth - 1) freshMetaVars rules $
+      preunify (maxDepth - 1) (freshMetaVars \\ scopeMeta) rules $
         newConstraints ++ map (applyMetaSubstConstraint id (fmap FreeVar subst)) otherConstraints
   ]
   where
