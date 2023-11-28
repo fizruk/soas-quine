@@ -27,7 +27,7 @@ import Data.Bifunctor.TH
 import Data.Void ( Void, absurd )
 import Data.Bitraversable ( Bitraversable(..) )
 import Data.Maybe (mapMaybe, maybeToList)
-import Data.List (intercalate, tails, inits)
+import Data.List (intercalate, tails, inits, nub)
 
 -- * SOAS
 
@@ -50,6 +50,14 @@ instance Bifunctor sig => Bifunctor (Equation sig) where
     where
       k (InL l) = InL l
       k (InR (MetaVarF m args)) = InR (MetaVarF (f m) args)
+
+instance Bifoldable sig => Bifoldable (Equation sig) where
+  bifoldMap f g (lhs :==: rhs) = go f g lhs <> go f g rhs
+    where
+      go :: Monoid m => (a -> m) -> (b -> m) -> SOAS sig a b -> m
+      go _ k (Pure x) = k x
+      go h k (Free (InL op)) = bifoldMap (go h (foldMap k)) (go h k) op
+      go h k (Free (InR (MetaVarF m args))) = h m <> foldMap (go h k) args
 
 deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term), Eq var, Eq metavar) => Eq (Equation sig metavar var)
 deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Equation sig metavar var)
@@ -325,7 +333,13 @@ whnfChainFromRules rules term
 data Constraint sig metavar var = Constraint
   { constraintEq :: Equation sig metavar (IncMany var)
   , constraintScope :: Int
-  }
+  } deriving (Functor)
+
+instance Bifunctor sig => Bifunctor (Constraint sig) where
+  bimap f g Constraint{..} = Constraint{constraintEq = bimap f (fmap g) constraintEq, ..}
+
+instance Bifoldable sig => Bifoldable (Constraint sig) where
+  bifoldMap f g Constraint{..} = bifoldMap f (foldMap g) constraintEq
 
 deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term), Eq var, Eq metavar) => Eq (Constraint sig metavar var)
 deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Constraint sig metavar var)
@@ -376,6 +390,66 @@ projectImitate Constraint{constraintEq = M m args :==: rhs} =
   ]
 projectImitate _ = []
 
+refreshAllMetaVars :: (Bifunctor sig, Bifoldable sig, Eq metavar) => [metavar] -> [metavar] -> SOAS sig metavar var -> SOAS sig metavar var
+refreshAllMetaVars scopeMeta freshMetaVars term = transFS k term
+  where
+    k (InR (MetaVarF m args)) = InR (MetaVarF (rename m) args)
+    k (InL op) = InL op
+
+    renamings = zip termMetaVars freshMetaVars'
+    rename m = case lookup m renamings of
+      Nothing -> error "impossible happened"
+      Just m' -> m'
+    freshMetaVars' = filter (`notElem` scopeMeta) freshMetaVars
+    termMetaVars = nub (go term)
+      where
+        go :: Bifoldable sig => SOAS sig metavar var -> [metavar]
+        go Pure{} = []
+        go (Free (InL op)) = bifoldMap go go op
+        go (Free (InR (MetaVarF m args))) = m : foldMap go args
+
+refreshAllMetaVarsEquation :: (Bifunctor sig, Bifoldable sig, Eq metavar) => [metavar] -> [metavar] -> Equation sig metavar var -> Equation sig metavar var
+refreshAllMetaVarsEquation scopeMeta freshMetaVars (lhs :==: rhs) = lhs' :==: rhs'
+  where
+    lhs' = transFS k lhs
+    rhs' = transFS k rhs
+
+    k (InR (MetaVarF m args)) = InR (MetaVarF (rename m) args)
+    k (InL op) = InL op
+
+    renamings = zip eqMetaVars freshMetaVars'
+    rename m = case lookup m renamings of
+      Nothing -> error "impossible happened"
+      Just m' -> m'
+    freshMetaVars' = filter (`notElem` scopeMeta) freshMetaVars
+    eqMetaVars = nub (foldMap go [lhs, rhs])
+      where
+        go :: Bifoldable sig => SOAS sig metavar var -> [metavar]
+        go Pure{} = []
+        go (Free (InL op)) = bifoldMap go go op
+        go (Free (InR (MetaVarF m args))) = m : foldMap go args
+
+matchingRoots :: ZipMatch sig => SOAS sig metavar var -> SOAS sig metavar var' -> Bool
+matchingRoots (Free (InL l)) (Free (InL r))
+  | Just _ <- zipMatch l r = True
+matchingRoots _ _ = False
+
+mutate :: [metavar] -> [metavar] -> [Equation sig metavar var] -> TransitionRule sig metavar var
+mutate scopeMeta freshMetaVars rules Constraint{constraintEq = lhs :==: rhs, ..} =
+  [ (mempty,
+    [ Constraint{constraintEq = lhs :==: ruleLHS, ..}
+    , Constraint{constraintEq = ruleRHS :==: rhs, ..} ])
+  | rule@(lhsOrig :==: _) <- rules
+  , any (matchingRoots lhsOrig) [lhs, rhs]
+  , let refreshedRule = refreshAllMetaVarsEquation scopeMeta freshMetaVars rule
+  , let instantiatedRule = addVarArgsEquation [BoundVar i | i <- [0 .. constraintScope - 1]] (FreeVar <$> refreshedRule)
+  , let ruleLHS :==: ruleRHS = instantiatedRule
+  ]
+-- mutate _ _ _ _ = []
+
+stuck :: TransitionRule sig metavar var
+stuck constraint = [(mempty, [constraint])]
+
 onlyFreeVar :: IncMany var -> [var]
 onlyFreeVar (FreeVar x) = [x]
 onlyFreeVar BoundVar{} = []
@@ -389,17 +463,26 @@ choose xs =
 
 preunify
   :: (Matchable sig, Eq metavar, Eq var)
-  => [Equation sig metavar var]
+  => Int
+  -> [metavar]
+  -> [Equation sig metavar var]
   -> UnificationProblem sig metavar var
   -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
-preunify _ [] = [(mempty, [])]
-preunify rules constraints =
+preunify _ _ _ [] = [(mempty, [])]
+preunify 0 _ _ _ = []
+preunify maxDepth freshMetaVars rules constraints =
   [ (subst <> finalSubst, unsolvedConstraints)
   | (constraint, otherConstraints) <- choose constraints
-  , (subst, newConstraints) <- (decompose <> projectImitate) constraint
+  , (subst, newConstraints) <- (decompose <> projectImitate <> mutate scopeMeta freshMetaVars rules) constraint
   , (finalSubst, unsolvedConstraints) <-
-      preunify rules (newConstraints ++ map (applyMetaSubstConstraint id (fmap FreeVar subst)) otherConstraints)
+      preunify (maxDepth - 1) freshMetaVars rules $
+        newConstraints ++ map (applyMetaSubstConstraint id (fmap FreeVar subst)) otherConstraints
   ]
+  where
+    scopeMeta = foldMap (bifoldMap pure (const [])) constraints
+
+defaultFreshMetaVars :: [String]
+defaultFreshMetaVars = [ "m" <> show n | n <- [0..]]
 
 -- mutate :: (Matchable sig, Eq var, Eq metavar)
 --   => [Equation sig metavar Void] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
