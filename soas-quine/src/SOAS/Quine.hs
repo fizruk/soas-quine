@@ -18,13 +18,15 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use &&" #-}
 {-# HLINT ignore "Use ++" #-}
+{-# OPTIONS_GHC -Wno-missing-pattern-synonym-signatures #-}
+{-# OPTIONS_GHC -Wno-type-defaults #-}
 module SOAS.Quine where
 
 import Data.Bifunctor ( Bifunctor(first, bimap) )
 import Data.Bifoldable ( Bifoldable(bifoldMap, bifold) )
 
-import Control.Monad ( (>=>), guard, when )
-import Control.Monad.State
+import Control.Monad ( (>=>), guard )
+import Control.Monad.State hiding (state)
 import Free.Scoped
     ( traverseFS, type (:+:), FS(..), Inc(..), Sum(InL, InR), transFS )
 import Free.Scoped.TH ( makePatternsAll )
@@ -33,7 +35,7 @@ import Data.Bifunctor.TH
 import Data.Void ( Void, absurd )
 import Data.Bitraversable ( Bitraversable(..) )
 import Data.Maybe (mapMaybe, maybeToList)
-import Data.List (intercalate, tails, inits, nub, (\\))
+import Data.List (intercalate, tails, inits, nub, (\\), sortOn)
 import qualified Debug.Trace
 import Data.Foldable (Foldable(toList))
 
@@ -461,9 +463,26 @@ projectImitate scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: M m ar
   projectImitate' scopeMeta freshMetaVars (m, args) lhs constraintScope
 projectImitate _ _ _ = []
 
+eliminateMetaVar :: TransitionRule sig metavar var
+eliminateMetaVar Constraint{constraintEq = M{} :==: M{}, ..} = []
+eliminateMetaVar Constraint{constraintEq = M m args :==: rhs, ..}
+  | all isConst args && distinct args =
+    [ (MetaSubst [(m, substBody')] <> subst', [])
+    | (substBody, subst) <- matchMetaVar args [] rhs
+    , substBody' <- traverse (traverse onlyFreeVar) substBody
+    , subst' <- traverse onlyFreeVar subst
+    ]
+  where
+    isConst = null . metavarsOf
+    distinct xs = xs == nub xs
+eliminateMetaVar Constraint{constraintEq = lhs :==: rhs@(M m args), ..} =
+  eliminateMetaVar Constraint{constraintEq = rhs :==: lhs, ..}
+eliminateMetaVar _ = []
+
+
 -- forall k. (λ x. k M6[x, k]) M3[k] =?= M6[M3[k],k]
 imitate :: [metavar] -> [metavar] -> TransitionRule sig metavar var
-imitate scopeMeta freshMetaVars Constraint{constraintEq = M m args :==: Free (InL rhs), ..} = trace "IMITATE" $ do
+imitate scopeMeta freshMetaVars Constraint{constraintEq = M m args :==: Free (InL rhs), ..} = do
   -- ∀ z1, ..., zN.  M[a1, ..., aM] =?= F(t1, x.t2)
   -- M[x1, ..., xM] := F(M1[x1, ..., xM], x.M2[x, x1, ..., xM])
   let args' = [ Pure (BoundVar i) | i <- [0 .. length args - 1] ]
@@ -538,8 +557,8 @@ matchingRoots (Free (InL l)) (Free (InL r))
 matchingRoots (Free InL{}) (Free InR{}) = True
 matchingRoots _ _ = False
 
-mutate :: [metavar] -> [metavar] -> [Equation sig metavar var] -> TransitionRule sig metavar var
-mutate scopeMeta freshMetaVars rules Constraint{constraintEq = lhs :==: rhs, ..} = do
+mutate :: [Equation sig metavar var] -> [metavar] -> [metavar] -> TransitionRule sig metavar var
+mutate rules scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..} = do
   rule@(lhsOrig :==: rhsOrig) <- rules
   let refreshedRule = refreshAllMetaVarsEquation scopeMeta freshMetaVars rule
   let instantiatedRule = addVarArgsEquation [BoundVar i | i <- [0 .. constraintScope - 1]] (FreeVar <$> refreshedRule)
@@ -570,6 +589,67 @@ choose xs =
   | y:after <- tails xs
   | before <- inits xs
   ]
+
+searchWith
+  :: (Monoid m, Eq m, Show a, Show m)
+  => [String]                           -- hints for rule application
+  -> (Int, [(String, Int)])             -- limits for the search
+  -> state                              -- internal state
+  -> (m -> a -> a)                      -- update function
+  -> [[(String, state -> a -> [(Int, (state, (m, [a])))])]] -- transition rules, in priority groups
+  -> [a]                                -- initial constraints
+  -> [(m, [a])]                         -- result
+searchWith = go 0
+  where
+    go depth hints (maxDepth, limits) state update rules xs
+      | null xs = [(mempty, [])]
+      | maxDepth <= depth = []
+      | otherwise = do
+          -- identify rules that cannot be used anymore
+          let deadRules = [ name | (name, 0) <- limits]
+          -- remove "dead" rules
+          let liveRuleGroups = map (filter ((`notElem` deadRules) . fst)) rules
+
+          branches <-
+            -- branch only using rules for the first priority group with any transitions
+            take 1 $ dropWhile (all null)
+              [ sortOn (length . take 3)  -- prioritise non-branching rules
+                  [ [ (name, x, y, xs')
+                    | (name, rule) <- liveRules
+                    , y <- rule state x <> trace (replicate depth ' ' <> "- FAIL (" <> name <> ") for " <> show x) [] ]
+                  | (x, xs') <- choose xs ]
+              | liveRules <- liveRuleGroups ]
+
+          -- should this be enabled?
+          guard $ not (any null branches)
+
+          branch <- branches
+          (name, x, (_priority, (state', (m, ys))), xs') <-
+            sortOn (\(_, _, (priority, _), _) -> priority)
+              branch
+
+          -- follow hints, if provided
+          hints' <- case hints of
+            [] -> return []
+            hint : hints' -> do
+              guard (name == hint)
+              return hints'
+
+          -- trace search path
+          trace (replicate depth ' ' <> "- (" <> name <> ")") $
+            trace (replicate depth ' ' <> "  " <> show x) $
+            (if m == mempty then id else trace (replicate depth ' ' <> "  " <> show m <> ")")) $ do
+              (if null ys then id else trace (replicate depth ' ' <> "  " <> show ys <> ")")) $ do
+                -- solve the rest
+                let limits' = updateAt name (subtract 1) limits
+                (m', zs) <- go (depth + 1) hints' (maxDepth, limits') state' update liveRuleGroups (ys ++ map (update m) xs')
+                return (m <> m', zs)
+
+updateAt :: Eq k => k -> (v -> v) -> [(k, v)] -> [(k, v)]
+updateAt _ _ [] = []
+updateAt k f ((k', v) : kvs)
+  | k == k' = (k', f v) : kvs
+  | otherwise = (k', v) : updateAt k f kvs
 
 defaultPreunify
   :: (Matchable sig, Eq var
@@ -615,51 +695,109 @@ preunify
   -> [Equation sig metavar var]
   -> UnificationProblem sig metavar var
   -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
-preunify _ _ _ _ _ [] = [(mempty, [])]
-preunify _ (n, _) _ _ _ _cs | n < 0 = [] -- [(mempty, cs)]
-preunify guide (maxDepth, maxMutate) scopeMeta freshMetaVars rules constraints = do
-  (constraint, otherConstraints) <- choose constraints
-  case delete constraint of
-    _:_ -> trace (replicate (30 - maxDepth) ' ' <> "- (delete) " <> ppConstraint constraint) $ do
-      newGuide <- case guide of
-        [] -> return []
-        action : actions -> do
-          guard ("delete" == action)
-          return actions
-      preunify newGuide (maxDepth - 1, maxMutate) scopeMeta (freshMetaVars \\ scopeMeta) rules otherConstraints
-    [] -> do
-      (name, trans) <-
-        [ ("decompose",       decompose)
-        , ("project/imitate", projectImitate scopeMeta freshMetaVars)
-        , ("mutate",          mutate scopeMeta freshMetaVars rules)]
-      newGuide <- case guide of
-        [] -> return []
-        action : actions -> do
-          guard (name == action)
-          return actions
-      let (newMaxDepth, newMaxMutate)
-            | name == "mutate" = (maxDepth - 1, maxMutate - 1)
-            | otherwise = (maxDepth - 1, maxMutate)
-      guard $ (name /= "mutate") || maxMutate > 0
-      (subst, newConstraints) <- trans constraint
-      let newScopeMeta = foldMap (metavarsOf . snd) (getMetaSubsts subst) <> foldMap (bifoldMap pure (const [])) newConstraints
-      let constraints' = newConstraints ++ map (applyMetaSubstConstraint id (fmap FreeVar subst)) otherConstraints
-      let scopeMeta' = nub (scopeMeta <> newScopeMeta)
-      (finalSubst, unsolvedConstraints) <-
-        trace (replicate (30 - maxDepth) ' ' <> "- [" <> show (maxDepth, maxMutate) <> "] (" <> name <> ")") $
-        trace (replicate (30 - maxDepth) ' ' <> "  " <> show constraint) $
-        (if null newConstraints then id else trace (replicate (30 - maxDepth) ' ' <> "  NEW: " <> show newConstraints)) $
-        (if subst == mempty then id else trace (replicate (30 - maxDepth) ' ' <> "  " <> show subst)) $ do
-          when (not (distinct (map fst (getMetaSubsts subst)))) $
-            error $ "impossible:\n" <> unlines
-              [ "subst = " <> show subst
-              , "newConstraints = " <> show newConstraints
-              , "scopeMeta = " <> show scopeMeta
-              ]
-          preunify newGuide (newMaxDepth, newMaxMutate) scopeMeta' (freshMetaVars \\ scopeMeta') rules constraints'
-      return (applyMetaSubstSubst id finalSubst subst <> finalSubst, unsolvedConstraints)
-      where
-        distinct xs = xs == nub xs
+preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints = do
+  (MetaSubst substs, unsolved) <- searchWith hints
+    (maxDepth, [("mutate", maxMutate)])
+    (targetMetas, scopeMeta, freshMetaVars)
+    (applyMetaSubstConstraint id . fmap FreeVar)
+    rules'
+    constraints
+  let substs' = foldr (\ m s -> applyMetaSubstSubst id s (MetaSubst [m]) <> s) mempty substs
+  return (substs', unsolved)
+  where
+    targetMetas = foldMap (bifoldMap pure (const [])) constraints
+
+    rules' =
+      [ -- try (delete) when possible
+        [ ("delete", stateless delete) ]
+        -- then (eliminate*) when possible
+      -- , [ ("eliminate*", stateless eliminateMetaVar) ]
+        -- else, try (decompose), (project), (imitate), and (mutate)
+      , [ ("decompose", stateless decompose)
+        , ("project/imitate", auto projectImitate)
+        -- , ("project", stateless project)
+        -- , ("imitate", auto imitate)
+        , ("mutate", auto (mutate axioms))
+        ]
+      ]
+
+    stateless
+      :: (a -> [(m, [a])])
+      -> state
+      -> a
+      -> [(Int, (state, (m, [a])))]
+    stateless f state x =
+      [ (-100, (state, y)) | y <- f x ]
+
+    auto
+      :: (Matchable sig, Eq metavar, Eq var)
+      => ([metavar] -> [metavar] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])])
+      -> ([metavar], [metavar], [metavar])
+      -> Constraint sig metavar var
+      -> [(Int, (([metavar], [metavar], [metavar]), (MetaSubst sig metavar metavar var, [Constraint sig metavar var])))]
+    auto f (targets, scope, fresh) x =
+      [ (priority, (state', (subst, newConstraints)))
+      | (subst, newConstraints) <- f scope fresh x
+      , let new = foldMap (metavarsOf . snd) (getMetaSubsts subst) <> foldMap (bifoldMap pure (const [])) newConstraints
+      , let isTargetSubst = (`elem` targets) . fst
+      , let targetSubsts = filter isTargetSubst (getMetaSubsts subst)
+      , let priority
+              | subst == mempty = -50
+              | otherwise = negate (length targetSubsts)
+      , let newTargets = foldMap (metavarsOf . snd) targetSubsts
+      , let targets' = nub (targets <> newTargets)
+      , let state' = (targets', nub (new <> scope), fresh \\ new)
+      ]
+
+    -- tryDecompose :: (Eq metavar, Eq var, Matchable sig) => Constraint sig metavar var -> [Constraint sig metavar var]
+    -- tryDecompose c@Constraint{ constraintEq = Free InL{} :==: Free InL{} } = concatMap snd (decompose c)
+    -- tryDecompose c = [c]
+
+-- preunify _ _ _ _ _ [] = [(mempty, [])]
+-- preunify _ (n, _) _ _ _ _cs | n < 0 = [] -- [(mempty, cs)]
+-- preunify guide (maxDepth, maxMutate) scopeMeta freshMetaVars rules constraints = do
+--   (constraint, otherConstraints) <- choose constraints
+--   case delete constraint of
+--     _:_ -> trace (replicate (30 - maxDepth) ' ' <> "- (delete) " <> ppConstraint constraint) $ do
+--       newGuide <- case guide of
+--         [] -> return []
+--         action : actions -> do
+--           guard ("delete" == action)
+--           return actions
+--       preunify newGuide (maxDepth - 1, maxMutate) scopeMeta (freshMetaVars \\ scopeMeta) rules otherConstraints
+--     [] -> do
+--       (name, trans) <-
+--         [ ("decompose",       decompose)
+--         , ("project/imitate", projectImitate scopeMeta freshMetaVars)
+--         , ("mutate",          mutate scopeMeta freshMetaVars rules)]
+--       newGuide <- case guide of
+--         [] -> return []
+--         action : actions -> do
+--           guard (name == action)
+--           return actions
+--       let (newMaxDepth, newMaxMutate)
+--             | name == "mutate" = (maxDepth - 1, maxMutate - 1)
+--             | otherwise = (maxDepth - 1, maxMutate)
+--       guard $ (name /= "mutate") || maxMutate > 0
+--       (subst, newConstraints) <- trans constraint
+--       let newScopeMeta = foldMap (metavarsOf . snd) (getMetaSubsts subst) <> foldMap (bifoldMap pure (const [])) newConstraints
+--       let constraints' = newConstraints ++ map (applyMetaSubstConstraint id (fmap FreeVar subst)) otherConstraints
+--       let scopeMeta' = nub (scopeMeta <> newScopeMeta)
+--       (finalSubst, unsolvedConstraints) <-
+--         trace (replicate (30 - maxDepth) ' ' <> "- [" <> show (maxDepth, maxMutate) <> "] (" <> name <> ")") $
+--         trace (replicate (30 - maxDepth) ' ' <> "  " <> show constraint) $
+--         (if null newConstraints then id else trace (replicate (30 - maxDepth) ' ' <> "  NEW: " <> show newConstraints)) $
+--         (if subst == mempty then id else trace (replicate (30 - maxDepth) ' ' <> "  " <> show subst)) $ do
+--           when (not (distinct (map fst (getMetaSubsts subst)))) $
+--             error $ "impossible:\n" <> unlines
+--               [ "subst = " <> show subst
+--               , "newConstraints = " <> show newConstraints
+--               , "scopeMeta = " <> show scopeMeta
+--               ]
+--           preunify newGuide (newMaxDepth, newMaxMutate) scopeMeta' (freshMetaVars \\ scopeMeta') rules constraints'
+--       return (applyMetaSubstSubst id finalSubst subst <> finalSubst, unsolvedConstraints)
+--       where
+--         distinct xs = xs == nub xs
 
 ppConstraint :: (Show var, Show metavar, forall scope term. (Show scope, Show term) => Show (sig scope term)) => Constraint sig metavar var -> String
 ppConstraint Constraint{constraintEq = (lhs :==: rhs), ..} = "∀" <> show constraintScope <> ". " <> show lhs <> "  =?=  " <> show rhs
@@ -809,7 +947,7 @@ checkExample10 = and
 solveId :: (Eq var, Show var) => [SOAS LambdaF String (IncMany var)]
 solveId =
   [ body
-  | (MetaSubst subst, _unsolved) <- defaultPreunify (100, 3) [beta]
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (8, 3) [beta]
       [Constraint{ constraintEq = e, constraintScope = 1}]
   , Just body <- [lookup "ID" subst]
   ]
@@ -834,7 +972,7 @@ solveId =
 solveConst :: (Eq var, Show var) => [SOAS LambdaF String (IncMany var)]
 solveConst =
   [ body
-  | (MetaSubst subst, _unsolved) <- defaultPreunify (100, 3) [beta]
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (9, 3) [beta]
       [Constraint{ constraintEq = e, constraintScope = 2}]
   , Just body <- [lookup "CONST" subst]
   ]
@@ -862,16 +1000,16 @@ solveFix =
       , "decompose"
       , "project/imitate"
       , "mutate"
-      , "decompose"
-      , "decompose"
-      , "project/imitate"
-      , "project/imitate"
-      , "project/imitate"
-      , "decompose"
-      , "project/imitate"
-      , "project/imitate"
-      , "project/imitate"
-      , "delete"
+      -- , "decompose"
+      -- , "decompose"
+      -- , "project/imitate"
+      -- , "project/imitate"
+      -- , "project/imitate"
+      -- , "decompose"
+      -- , "project/imitate"
+      -- , "project/imitate"
+      -- , "project/imitate"
+      -- , "delete"
       ]
       (22, 3)
       ["FIX"]
