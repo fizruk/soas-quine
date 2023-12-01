@@ -22,7 +22,7 @@
 {-# OPTIONS_GHC -Wno-type-defaults #-}
 module SOAS.Quine where
 
-import Data.Bifunctor ( Bifunctor(first, bimap) )
+import Data.Bifunctor ( Bifunctor(first, bimap, second) )
 import Data.Bifoldable ( Bifoldable(bifoldMap, bifold) )
 
 import Control.Monad ( (>=>), guard )
@@ -35,13 +35,15 @@ import Data.Bifunctor.TH
 import Data.Void ( Void, absurd )
 import Data.Bitraversable ( Bitraversable(..) )
 import Data.Maybe (mapMaybe, maybeToList)
-import Data.List (intercalate, tails, inits, nub, (\\), sortOn)
+import Data.List (intercalate, tails, inits, nub, (\\), sortOn, intersect)
 import qualified Debug.Trace
 import Data.Foldable (Foldable(toList))
+import Data.Monoid (All(..))
+import qualified Data.Map as Map
 
 trace :: String -> a -> a
--- trace = Debug.Trace.trace
-trace _ = id
+trace = Debug.Trace.trace
+-- trace _ = id
 
 -- * SOAS
 
@@ -56,7 +58,7 @@ type SOAS sig metavar var = FS (sig :+: MetaF metavar) var
 
 data Equation sig metavar var =
   SOAS sig metavar var :==: SOAS sig metavar var
-  deriving (Functor)
+  deriving (Functor, Foldable)
 
 instance Bifunctor sig => Bifunctor (Equation sig) where
   bimap f g (lhs :==: rhs) =
@@ -101,7 +103,9 @@ applyMetaSubst rename substs = \case
       Just body -> body >>= f (map (applyMetaSubst rename substs) args)
   Free (InL op) -> Free (InL (bimap (applyMetaSubst rename (fmap S substs)) (applyMetaSubst rename substs) op))
   where
-    f args (BoundVar i) = args !! i
+    f args (BoundVar i)
+      | i < length args = args !! i
+      | otherwise = error $ "index too large (i = " <> show i <> ", length args = " <> show (length args) <> ")"
     f _args (FreeVar x) = Pure x
 
 applyMetaSubstSubst :: (Eq b, Bifunctor sig)
@@ -465,15 +469,21 @@ projectImitate _ _ _ = []
 
 eliminateMetaVar :: TransitionRule sig metavar var
 eliminateMetaVar Constraint{constraintEq = M{} :==: M{}, ..} = []
-eliminateMetaVar Constraint{constraintEq = M m args :==: rhs, ..}
-  | all isConst args && distinct args =
-    [ (MetaSubst [(m, substBody')] <> subst', [])
-    | (substBody, subst) <- matchMetaVar args [] rhs
-    , substBody' <- traverse (traverse onlyFreeVar) substBody
-    , subst' <- traverse onlyFreeVar subst
-    ]
+eliminateMetaVar Constraint{constraintEq = lhs@(M m args) :==: rhs, ..}
+  | and
+    [ all isVar args
+    -- , distinct args
+    , m `notElem` metavarsOf rhs
+    , all (`elem` varsOf lhs) (varsOf rhs) ] =
+      [ (MetaSubst [(m, substBody')] <> subst', [])
+      | (substBody, subst) <- matchMetaVar args [] rhs
+      , substBody' <- traverse (traverse onlyFreeVar) substBody
+      , subst' <- traverse onlyFreeVar subst
+      ]
   where
-    isConst = null . metavarsOf
+    isVar Pure{} = True
+    isVar _ = False
+    -- isConst = null . metavarsOf
     distinct xs = xs == nub xs
 eliminateMetaVar Constraint{constraintEq = lhs :==: rhs@(M m args), ..} =
   eliminateMetaVar Constraint{constraintEq = rhs :==: lhs, ..}
@@ -551,9 +561,82 @@ refreshAllMetaVarsEquation scopeMeta freshMetaVars (lhs :==: rhs) = lhs' :==: rh
         go (Free (InL op)) = bifoldMap go go op
         go (Free (InR (MetaVarF m args))) = m : foldMap go args
 
-matchingRoots :: ZipMatch sig => SOAS sig metavar var -> SOAS sig metavar var' -> Bool
+mutate' :: Ord metavar => [Equation sig metavar var] -> [metavar] -> [metavar] -> TransitionRule sig metavar var
+mutate' rules scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..} = mconcat
+  [ mutateWith rule' scopeMeta freshMetaVars c
+  | rule <- rules
+  , rule' <- [rule, sym rule]
+  , c <- [ Constraint{constraintEq = lhs :==: rhs, ..}
+         , Constraint{constraintEq = rhs :==: lhs, ..} ]
+  ]
+  where
+    sym (x :==: y) = y :==: x
+
+mutateWith :: (Ord metavar, Bifunctor sig) => Equation sig metavar var -> [metavar] -> [metavar] -> TransitionRule sig metavar var
+mutateWith rule scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..} = do
+  let refreshedRule = refreshAllMetaVarsEquation scopeMeta freshMetaVars rule
+  let instantiatedRule = addVarArgsEquation [BoundVar i | i <- [0 .. constraintScope - 1]] (FreeVar <$> refreshedRule)
+  let ruleLHS :==: ruleRHS = instantiatedRule
+  Free InL{} <- [ruleLHS]
+  (allowedVars, decomposedLHS) <- matchAxiomPart ruleLHS lhs
+  let allowedVars' = Map.toList (Map.fromListWith intersect allowedVars)
+  let newConstraints = decomposedLHS ++ [ Constraint{constraintEq = ruleRHS :==: rhs, ..} ]
+  return (mempty, map (keepAllowedVars allowedVars') newConstraints)
+  where
+    keepAllowedVars :: (Eq metavar, Bifunctor sig) => [(metavar, [Int])] -> Constraint sig metavar var -> Constraint sig metavar var
+    keepAllowedVars vars Constraint{constraintEq = lhs' :==: rhs', ..} =
+      Constraint{constraintEq = keepAllowedVars' vars lhs' :==: keepAllowedVars' vars rhs', ..}
+
+    keepAllowedVars' :: (Eq metavar, Bifunctor sig) => [(metavar, [Int])] -> SOAS sig metavar var -> SOAS sig metavar var
+    keepAllowedVars' _ t@Pure{} = t
+    keepAllowedVars' vars (Free (InL op)) = Free (InL (bimap (keepAllowedVars' vars) (keepAllowedVars' vars) op))
+    keepAllowedVars' vars (Free (InR (MetaVarF m args))) =
+      Free (InR (MetaVarF m (map snd $ filter isAllowed (zip [0..] (map (keepAllowedVars' vars) args)))))
+      where
+        isAllowed (j, Pure{})
+          | j < constraintScope
+          , Just vars' <- lookup m vars
+          = j `elem` vars'
+        isAllowed _ = True
+
+    matchAxiomPart
+      :: (ZipMatch sig, Bitraversable sig)
+      => SOAS sig metavar (IncMany var)
+      -> SOAS sig metavar (IncMany var)
+      -> [([(metavar, [Int])], [Constraint sig metavar var])]
+    matchAxiomPart (Free (InL l)) (Free (InL r)) = do
+      Just lr <- [zipMatch l r]
+      lr' <- bitraverse (map (second (map extendConstraint)) . uncurry matchAxiomPart' . bimap (fmap k) (fmap k)) (uncurry matchAxiomPart') lr
+      return (bifold lr')
+      where
+        matchAxiomPart' (Free InL{}) Pure{} = []
+        matchAxiomPart' l' r' =
+          return ([ (ml, foldMap toBoundIndex (varsOf r')) | ml <- metavarsOf l'], [Constraint (l' :==: r') constraintScope])
+    matchAxiomPart l@(Free InL{}) r@(Free InR{}) =
+      return ([ (ml, foldMap toBoundIndex (varsOf r)) | ml <- metavarsOf l], [Constraint (l :==: r) constraintScope])
+    matchAxiomPart (Free InL{}) Pure{} = []
+    matchAxiomPart l r = return ([], [Constraint (l :==: r) constraintScope])
+
+    k :: Inc (IncMany a) -> IncMany (Inc a)
+    k Z = FreeVar Z
+    k (S (BoundVar i)) = BoundVar i
+    k (S (FreeVar x)) = FreeVar (S x)
+
+    toBoundIndex (BoundVar i) = [i]
+    toBoundIndex _ = []
+
+extendConstraint :: Bifunctor sig => Constraint sig metavar (Inc var) -> Constraint sig metavar var
+extendConstraint Constraint{..} = Constraint
+  { constraintEq = fmap k constraintEq
+  , constraintScope = 1 + constraintScope}
+  where
+    k (FreeVar Z) = BoundVar constraintScope
+    k (FreeVar (S x)) = FreeVar x
+    k (BoundVar i) = BoundVar i
+
+matchingRoots :: (Bifoldable sig, ZipMatch sig) => SOAS sig metavar var -> SOAS sig metavar var' -> Bool
 matchingRoots (Free (InL l)) (Free (InL r))
-  | Just _ <- zipMatch l r = True
+  | Just lr <- zipMatch l r = getAll (bifoldMap (All . uncurry matchingRoots) (All . uncurry matchingRoots) lr)
 matchingRoots (Free InL{}) (Free InR{}) = True
 matchingRoots _ _ = False
 
@@ -590,6 +673,10 @@ choose xs =
   | before <- inits xs
   ]
 
+orElse :: [a] -> [a] -> [a]
+orElse [] ys = ys
+orElse xs _ = xs
+
 searchWith
   :: (Monoid m, Eq m, Show a, Show m)
   => [String]                           -- hints for rule application
@@ -616,12 +703,13 @@ searchWith = go 0
               [ sortOn (length . take 3)  -- prioritise non-branching rules
                   [ [ (name, x, y, xs')
                     | (name, rule) <- liveRules
-                    , y <- rule state x <> trace (replicate depth ' ' <> "- FAIL (" <> name <> ") for " <> show x) [] ]
+                    , y <- rule state x -- `orElse` trace (replicate depth ' ' <> "- FAIL (" <> name <> ") for " <> show x) []
+                    ]
                   | (x, xs') <- choose xs ]
               | liveRules <- liveRuleGroups ]
 
           -- should this be enabled?
-          guard $ not (any null branches)
+          -- guard $ not (any null branches)
 
           branch <- branches
           (name, x, (_priority, (state', (m, ys))), xs') <-
@@ -685,7 +773,7 @@ defaultGuidedPreunify guide (maxDepth, maxMutate) rules constraints = nub $
     origMetas = foldMap (bifoldMap pure (const [])) constraints
 
 preunify
-  :: (Matchable sig, Eq metavar, Eq var
+  :: (Matchable sig, Ord metavar, Eq var
   , forall scope term. (Show scope, Show term) => Show (sig scope term)
   , Show var, Show metavar)
   => [String]
@@ -711,13 +799,14 @@ preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints 
       [ -- try (delete) when possible
         [ ("delete", stateless delete) ]
         -- then (eliminate*) when possible
-      -- , [ ("eliminate*", stateless eliminateMetaVar) ]
+      , [ ("eliminate*", stateless eliminateMetaVar) ]
         -- else, try (decompose), (project), (imitate), and (mutate)
       , [ ("decompose", stateless decompose)
-        , ("project/imitate", auto projectImitate)
-        -- , ("project", stateless project)
-        -- , ("imitate", auto imitate)
-        , ("mutate", auto (mutate axioms))
+        -- , ("project/imitate", auto projectImitate)
+        -- , ("eliminate*", stateless eliminateMetaVar)
+        , ("imitate", auto imitate)
+        , ("project", stateless project)
+        , ("mutate", auto (mutate' axioms))
         ]
       ]
 
@@ -729,25 +818,25 @@ preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints 
     stateless f state x =
       [ (-100, (state, y)) | y <- f x ]
 
-    auto
-      :: (Matchable sig, Eq metavar, Eq var)
-      => ([metavar] -> [metavar] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])])
-      -> ([metavar], [metavar], [metavar])
-      -> Constraint sig metavar var
-      -> [(Int, (([metavar], [metavar], [metavar]), (MetaSubst sig metavar metavar var, [Constraint sig metavar var])))]
-    auto f (targets, scope, fresh) x =
-      [ (priority, (state', (subst, newConstraints)))
-      | (subst, newConstraints) <- f scope fresh x
-      , let new = foldMap (metavarsOf . snd) (getMetaSubsts subst) <> foldMap (bifoldMap pure (const [])) newConstraints
-      , let isTargetSubst = (`elem` targets) . fst
-      , let targetSubsts = filter isTargetSubst (getMetaSubsts subst)
-      , let priority
-              | subst == mempty = -50
-              | otherwise = negate (length targetSubsts)
-      , let newTargets = foldMap (metavarsOf . snd) targetSubsts
-      , let targets' = nub (targets <> newTargets)
-      , let state' = (targets', nub (new <> scope), fresh \\ new)
-      ]
+auto
+  :: (Matchable sig, Eq metavar, Eq var)
+  => ([metavar] -> [metavar] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])])
+  -> ([metavar], [metavar], [metavar])
+  -> Constraint sig metavar var
+  -> [(Int, (([metavar], [metavar], [metavar]), (MetaSubst sig metavar metavar var, [Constraint sig metavar var])))]
+auto f (targets, scope, fresh) x =
+  [ (priority, (state', (subst, newConstraints)))
+  | (subst, newConstraints) <- f scope fresh x
+  , let new = foldMap (metavarsOf . snd) (getMetaSubsts subst) <> foldMap (bifoldMap pure (const [])) newConstraints
+  , let isTargetSubst = (`elem` targets) . fst
+  , let targetSubsts = filter isTargetSubst (getMetaSubsts subst)
+  , let priority
+          | subst == mempty = -50
+          | otherwise = negate (length targetSubsts)
+  , let newTargets = foldMap (metavarsOf . snd) targetSubsts
+  , let targets' = nub (targets <> newTargets)
+  , let state' = (targets', nub (new <> scope), fresh \\ new)
+  ]
 
     -- tryDecompose :: (Eq metavar, Eq var, Matchable sig) => Constraint sig metavar var -> [Constraint sig metavar var]
     -- tryDecompose c@Constraint{ constraintEq = Free InL{} :==: Free InL{} } = concatMap snd (decompose c)
@@ -907,6 +996,10 @@ untypedFix = LamE (AppE tt tt)
 beta :: Equation LambdaF String var
 beta = AppE (LamE (M "M" [Var Z])) (M "N" []) :==: M "M" [M "N" []]
 
+-- (\ z. M[z]) N[] = M[N[]]
+eta :: Equation LambdaF String var
+eta = LamE (AppE (M "M" []) (Var Z)) :==: M "M" []
+
 -- (\ s. \z. s (s z)) f
 -- M[z'] := \z. z' (z' z)
 -- N[] := f
@@ -947,7 +1040,7 @@ checkExample10 = and
 solveId :: (Eq var, Show var) => [SOAS LambdaF String (IncMany var)]
 solveId =
   [ body
-  | (MetaSubst subst, _unsolved) <- defaultPreunify (8, 3) [beta]
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (100, 3) [beta]
       [Constraint{ constraintEq = e, constraintScope = 1}]
   , Just body <- [lookup "ID" subst]
   ]
@@ -972,7 +1065,7 @@ solveId =
 solveConst :: (Eq var, Show var) => [SOAS LambdaF String (IncMany var)]
 solveConst =
   [ body
-  | (MetaSubst subst, _unsolved) <- defaultPreunify (9, 3) [beta]
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (100, 3) [beta]
       [Constraint{ constraintEq = e, constraintScope = 2}]
   , Just body <- [lookup "CONST" subst]
   ]
@@ -983,40 +1076,20 @@ solveConst =
     y = Var (BoundVar 1)
 
 -- TOO SLOW, no answer in reasonable time
-solveFix :: (Eq var, Show var) => [[(String, SOAS LambdaF String (IncMany var))]]
+solveFix :: (Eq var, Show var) => [SOAS LambdaF String (IncMany var)]
 solveFix =
-  [ subst
+  [ body
+  -- | (MetaSubst subst, _unsolved) <- defaultPreunify (25, 3) [beta]
+  --     [Constraint{ constraintEq = e, constraintScope = 1}]
   | (MetaSubst subst, _unsolved) <- preunify
-      [ -- HINTS for the unification search algorithm
-        "mutate"
-      , "decompose"
-      , "project/imitate"
-      , "decompose"
-      , "project/imitate"
-      , "project/imitate"
-      , "mutate"
-      , "project/imitate"
-      , "project/imitate"
-      , "decompose"
-      , "project/imitate"
-      , "mutate"
-      -- , "decompose"
-      -- , "decompose"
-      -- , "project/imitate"
-      -- , "project/imitate"
-      -- , "project/imitate"
-      -- , "decompose"
-      -- , "project/imitate"
-      -- , "project/imitate"
-      -- , "project/imitate"
-      -- , "delete"
-      ]
+      [] -- HINTS for the unification search algorithm ()
       (22, 3)
       ["FIX"]
       defaultFreshMetaVars
       [beta]
       [ Constraint{ constraintEq = e, constraintScope = 1} ]
       -- , Constraint{ constraintEq = e2, constraintScope = 1} ]
+  , Just body <- [lookup "FIX" subst]
   ]
   where
     -- FIX[] := λ f. M1[f]

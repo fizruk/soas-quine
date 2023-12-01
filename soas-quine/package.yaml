@@ -24,6 +24,7 @@ dependencies:
 - bifunctors
 - template-haskell
 - mtl
+- containers
 
 ghc-options:
 - -Wall
