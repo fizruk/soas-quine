@@ -42,8 +42,8 @@ import Data.Monoid (All(..))
 import qualified Data.Map as Map
 
 trace :: String -> a -> a
-trace = Debug.Trace.trace
--- trace _ = id
+-- trace = Debug.Trace.trace
+trace _ = id
 
 -- * SOAS
 
@@ -1081,14 +1081,8 @@ solveFix =
   [ body
   -- | (MetaSubst subst, _unsolved) <- defaultPreunify (25, 3) [beta]
   --     [Constraint{ constraintEq = e, constraintScope = 1}]
-  | (MetaSubst subst, _unsolved) <- preunify
-      [] -- HINTS for the unification search algorithm ()
-      (22, 3)
-      ["FIX"]
-      defaultFreshMetaVars
-      [beta]
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (22, 3) [beta]
       [ Constraint{ constraintEq = e, constraintScope = 1} ]
-      -- , Constraint{ constraintEq = e2, constraintScope = 1} ]
   , Just body <- [lookup "FIX" subst]
   ]
   where
