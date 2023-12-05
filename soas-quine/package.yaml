@@ -25,6 +25,7 @@ dependencies:
 - template-haskell
 - mtl
 - containers
+- logict
 
 ghc-options:
 - -Wall

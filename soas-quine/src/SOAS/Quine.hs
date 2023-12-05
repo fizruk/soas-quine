@@ -40,6 +40,8 @@ import qualified Debug.Trace
 import Data.Foldable (Foldable(toList))
 import Data.Monoid (All(..))
 import qualified Data.Map as Map
+import Control.Applicative
+import Control.Monad.Logic
 
 trace :: String -> a -> a
 -- trace = Debug.Trace.trace
@@ -468,11 +470,11 @@ projectImitate scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: M m ar
 projectImitate _ _ _ = []
 
 eliminateMetaVar :: TransitionRule sig metavar var
-eliminateMetaVar Constraint{constraintEq = M{} :==: M{}, ..} = []
-eliminateMetaVar Constraint{constraintEq = lhs@(M m args) :==: rhs, ..}
+eliminateMetaVar Constraint{constraintEq = M{} :==: M{}} = []
+eliminateMetaVar Constraint{constraintEq = lhs@(M m args) :==: rhs}
   | and
-    [ all isVar args
-    -- , distinct args
+    [ all isVar args  -- TODO: maybe isConst is enough?
+    , distinct args   -- TODO: do we need this?
     , m `notElem` metavarsOf rhs
     , all (`elem` varsOf lhs) (varsOf rhs) ] =
       [ (MetaSubst [(m, substBody')] <> subst', [])
@@ -572,21 +574,10 @@ mutate' rules scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..
   where
     sym (x :==: y) = y :==: x
 
-mutateWith :: (Ord metavar, Bifunctor sig) => Equation sig metavar var -> [metavar] -> [metavar] -> TransitionRule sig metavar var
-mutateWith rule scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..} = do
-  let refreshedRule = refreshAllMetaVarsEquation scopeMeta freshMetaVars rule
-  let instantiatedRule = addVarArgsEquation [BoundVar i | i <- [0 .. constraintScope - 1]] (FreeVar <$> refreshedRule)
-  let ruleLHS :==: ruleRHS = instantiatedRule
-  Free InL{} <- [ruleLHS]
-  (allowedVars, decomposedLHS) <- matchAxiomPart ruleLHS lhs
-  let allowedVars' = Map.toList (Map.fromListWith intersect allowedVars)
-  let newConstraints = decomposedLHS ++ [ Constraint{constraintEq = ruleRHS :==: rhs, ..} ]
-  return (mempty, map (keepAllowedVars allowedVars') newConstraints)
+keepAllowedVars :: (Eq metavar, Bifunctor sig) => [(metavar, [Int])] -> Constraint sig metavar var -> Constraint sig metavar var
+keepAllowedVars vars1 Constraint{constraintEq = lhs' :==: rhs', ..} =
+  Constraint{constraintEq = keepAllowedVars' vars1 lhs' :==: keepAllowedVars' vars1 rhs', ..}
   where
-    keepAllowedVars :: (Eq metavar, Bifunctor sig) => [(metavar, [Int])] -> Constraint sig metavar var -> Constraint sig metavar var
-    keepAllowedVars vars Constraint{constraintEq = lhs' :==: rhs', ..} =
-      Constraint{constraintEq = keepAllowedVars' vars lhs' :==: keepAllowedVars' vars rhs', ..}
-
     keepAllowedVars' :: (Eq metavar, Bifunctor sig) => [(metavar, [Int])] -> SOAS sig metavar var -> SOAS sig metavar var
     keepAllowedVars' _ t@Pure{} = t
     keepAllowedVars' vars (Free (InL op)) = Free (InL (bimap (keepAllowedVars' vars) (keepAllowedVars' vars) op))
@@ -599,6 +590,17 @@ mutateWith rule scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, 
           = j `elem` vars'
         isAllowed _ = True
 
+mutateWith :: (Ord metavar, Bifunctor sig) => Equation sig metavar var -> [metavar] -> [metavar] -> TransitionRule sig metavar var
+mutateWith rule scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..} = do
+  let refreshedRule = refreshAllMetaVarsEquation scopeMeta freshMetaVars rule
+  let instantiatedRule = addVarArgsEquation [BoundVar i | i <- [0 .. constraintScope - 1]] (FreeVar <$> refreshedRule)
+  let ruleLHS :==: ruleRHS = instantiatedRule
+  Free InL{} <- [ruleLHS]
+  (allowedVars, decomposedLHS) <- matchAxiomPart ruleLHS lhs
+  let allowedVars' = Map.toList (Map.fromListWith intersect allowedVars)
+  let newConstraints = decomposedLHS ++ [ Constraint{constraintEq = ruleRHS :==: rhs, ..} ]
+  return (mempty, map (keepAllowedVars allowedVars') newConstraints)
+  where
     matchAxiomPart
       :: (ZipMatch sig, Bitraversable sig)
       => SOAS sig metavar (IncMany var)
@@ -677,29 +679,46 @@ orElse :: [a] -> [a] -> [a]
 orElse [] ys = ys
 orElse xs _ = xs
 
+fromList :: MonadLogic logic => [a] -> logic a
+fromList [] = empty
+fromList (x:xs) = pure x <|> fromList xs
+
+fromListFair :: MonadLogic logic => [a] -> logic a
+fromListFair [] = empty
+fromListFair (x:xs) = pure x `interleave` fromList xs
+
 searchWith
-  :: (Monoid m, Eq m, Show a, Show m)
+  :: (Monoid m, Eq m, Show a, Show m, MonadLogic logic)
   => [String]                           -- hints for rule application
   -> (Int, [(String, Int)])             -- limits for the search
   -> state                              -- internal state
   -> (m -> a -> a)                      -- update function
   -> [[(String, state -> a -> [(Int, (state, (m, [a])))])]] -- transition rules, in priority groups
   -> [a]                                -- initial constraints
-  -> [(m, [a])]                         -- result
+  -> logic (m, [a])                     -- result
 searchWith = go 0
   where
+    go
+      :: (Monoid m, Eq m, Show a, Show m, MonadLogic logic)
+      => Int                                -- current depth
+      -> [String]                           -- hints for rule application
+      -> (Int, [(String, Int)])             -- limits for the search
+      -> state                              -- internal state
+      -> (m -> a -> a)                      -- update function
+      -> [[(String, state -> a -> [(Int, (state, (m, [a])))])]] -- transition rules, in priority groups
+      -> [a]                                -- initial constraints
+      -> logic (m, [a])                     -- result
     go depth hints (maxDepth, limits) state update rules xs
-      | null xs = [(mempty, [])]
-      | maxDepth <= depth = []
+      | null xs = return (mempty, [])
+      | maxDepth <= depth = empty
       | otherwise = do
           -- identify rules that cannot be used anymore
           let deadRules = [ name | (name, 0) <- limits]
           -- remove "dead" rules
           let liveRuleGroups = map (filter ((`notElem` deadRules) . fst)) rules
 
-          branches <-
-            -- branch only using rules for the first priority group with any transitions
-            take 1 $ dropWhile (all null)
+          branches <- -- branch only using rules for the first priority group with any transitions
+            once $ fromList $ dropWhile (all null)
               [ sortOn (length . take 3)  -- prioritise non-branching rules
                   [ [ (name, x, y, xs')
                     | (name, rule) <- liveRules
@@ -711,27 +730,29 @@ searchWith = go 0
           -- should this be enabled?
           -- guard $ not (any null branches)
 
-          branch <- branches
-          (name, x, (_priority, (state', (m, ys))), xs') <-
-            sortOn (\(_, _, (priority, _), _) -> priority)
-              branch
+          branch <- fromList branches
+          let selectBranch = do
+                (name, x, (_priority, (state', (m, ys))), xs') <- fromListFair $
+                  sortOn (\(_, _, (priority, _), _) -> priority)
+                    branch
+                -- follow hints, if provided
+                hints' <- case hints of
+                  [] -> return []
+                  hint : hints' -> do
+                    guard (name == hint)
+                    return hints'
+                return (hints', name, x, state', m, ys, xs')
 
-          -- follow hints, if provided
-          hints' <- case hints of
-            [] -> return []
-            hint : hints' -> do
-              guard (name == hint)
-              return hints'
-
-          -- trace search path
-          trace (replicate depth ' ' <> "- (" <> name <> ")") $
-            trace (replicate depth ' ' <> "  " <> show x) $
-            (if m == mempty then id else trace (replicate depth ' ' <> "  " <> show m <> ")")) $ do
-              (if null ys then id else trace (replicate depth ' ' <> "  " <> show ys <> ")")) $ do
-                -- solve the rest
-                let limits' = updateAt name (subtract 1) limits
-                (m', zs) <- go (depth + 1) hints' (maxDepth, limits') state' update liveRuleGroups (ys ++ map (update m) xs')
-                return (m <> m', zs)
+          selectBranch >>- \(hints', name, x, state', m, ys, xs') -> do
+            -- trace search path
+            trace (replicate depth ' ' <> "- (" <> name <> ")") $
+              trace (replicate depth ' ' <> "  " <> show x) $
+              (if m == mempty then id else trace (replicate depth ' ' <> "  " <> show m <> ")")) $ do
+                (if null ys then id else trace (replicate depth ' ' <> "  " <> show ys <> ")")) $ do
+                  -- solve the rest
+                  let limits' = updateAt name (subtract 1) limits
+                  (m', zs) <- go (depth + 1) hints' (maxDepth, limits') state' update liveRuleGroups (ys ++ map (update m) xs')
+                  return (m <> m', zs)
 
 updateAt :: Eq k => k -> (v -> v) -> [(k, v)] -> [(k, v)]
 updateAt _ _ [] = []
@@ -764,10 +785,9 @@ defaultGuidedPreunify
   -> [Equation sig String var]
   -> UnificationProblem sig String var
   -> [(MetaSubst sig String String var, [Constraint sig String var])]
-defaultGuidedPreunify guide (maxDepth, maxMutate) rules constraints = nub $
-  [ (MetaSubst (filter (isOrigMeta . fst) subst), unsolved)
-  | (MetaSubst subst, unsolved) <- preunify guide (maxDepth, maxMutate) origMetas defaultFreshMetaVars rules constraints
-  ]
+defaultGuidedPreunify guide (maxDepth, maxMutate) rules constraints = nub $ observeAll $ do
+  (MetaSubst subst, unsolved) <- preunify guide (maxDepth, maxMutate) origMetas defaultFreshMetaVars rules constraints
+  return (MetaSubst (filter (isOrigMeta . fst) subst), unsolved)
   where
     isOrigMeta = (`elem` origMetas)
     origMetas = foldMap (bifoldMap pure (const [])) constraints
@@ -775,14 +795,15 @@ defaultGuidedPreunify guide (maxDepth, maxMutate) rules constraints = nub $
 preunify
   :: (Matchable sig, Ord metavar, Eq var
   , forall scope term. (Show scope, Show term) => Show (sig scope term)
-  , Show var, Show metavar)
+  , Show var, Show metavar
+  , MonadLogic logic)
   => [String]
   -> (Int, Int)
   -> [metavar]
   -> [metavar]
   -> [Equation sig metavar var]
   -> UnificationProblem sig metavar var
-  -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])]
+  -> logic (MetaSubst sig metavar metavar var, [Constraint sig metavar var])
 preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints = do
   (MetaSubst substs, unsolved) <- searchWith hints
     (maxDepth, [("mutate", maxMutate)])
@@ -820,7 +841,7 @@ preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints 
 
 auto
   :: (Matchable sig, Eq metavar, Eq var)
-  => ([metavar] -> [metavar] -> Constraint sig metavar var -> [(MetaSubst sig metavar metavar var, [Constraint sig metavar var])])
+  => ([metavar] -> [metavar] -> TransitionRule sig metavar var)
   -> ([metavar], [metavar], [metavar])
   -> Constraint sig metavar var
   -> [(Int, (([metavar], [metavar], [metavar]), (MetaSubst sig metavar metavar var, [Constraint sig metavar var])))]
@@ -1079,9 +1100,7 @@ solveConst =
 solveFix :: (Eq var, Show var) => [SOAS LambdaF String (IncMany var)]
 solveFix =
   [ body
-  -- | (MetaSubst subst, _unsolved) <- defaultPreunify (25, 3) [beta]
-  --     [Constraint{ constraintEq = e, constraintScope = 1}]
-  | (MetaSubst subst, _unsolved) <- defaultPreunify (22, 3) [beta]
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (20, 3) [beta]
       [ Constraint{ constraintEq = e, constraintScope = 1} ]
   , Just body <- [lookup "FIX" subst]
   ]
