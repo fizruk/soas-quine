@@ -1,20 +1,20 @@
-{-# LANGUAGE QuantifiedConstraints #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveTraversable          #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE PatternSynonyms            #-}
+{-# LANGUAGE QuantifiedConstraints      #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE TypeOperators              #-}
+{-# LANGUAGE UndecidableInstances       #-}
 {-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ParallelListComp #-}
-{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE MultiWayIf                 #-}
+{-# LANGUAGE ParallelListComp           #-}
+{-# LANGUAGE RecordWildCards            #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use &&" #-}
 {-# HLINT ignore "Use ++" #-}
@@ -22,30 +22,31 @@
 {-# OPTIONS_GHC -Wno-type-defaults #-}
 module SOAS.Quine where
 
-import Data.Bifunctor ( Bifunctor(first, bimap, second) )
-import Data.Bifoldable ( Bifoldable(bifoldMap, bifold) )
+import           Data.Bifoldable     (Bifoldable (bifold, bifoldMap))
+import           Data.Bifunctor      (Bifunctor (bimap, first, second))
 
-import Control.Monad ( (>=>), guard )
-import Control.Monad.State hiding (state)
-import Free.Scoped
-    ( traverseFS, type (:+:), FS(..), Inc(..), Sum(InL, InR), transFS )
-import Free.Scoped.TH ( makePatternsAll )
-import Data.Bifunctor.TH
-    ( deriveBifoldable, deriveBifunctor, deriveBitraversable )
-import Data.Void ( Void, absurd )
-import Data.Bitraversable ( Bitraversable(..) )
-import Data.Maybe (mapMaybe, maybeToList)
-import Data.List (intercalate, tails, inits, nub, (\\), sortOn, intersect)
+import           Control.Applicative
+import           Control.Monad       (guard, (>=>))
+import           Control.Monad.Logic
+import           Control.Monad.State hiding (state)
+import           Data.Bifunctor.TH   (deriveBifoldable, deriveBifunctor,
+                                      deriveBitraversable)
+import           Data.Bitraversable  (Bitraversable (..))
+import           Data.Foldable       (Foldable (toList))
+import           Data.List           (inits, intercalate, intersect, nub,
+                                      sortOn, tails, (\\))
+import qualified Data.Map            as Map
+import           Data.Maybe          (mapMaybe, maybeToList)
+import           Data.Monoid         (All (..))
+import           Data.Void           (Void, absurd)
 import qualified Debug.Trace
-import Data.Foldable (Foldable(toList))
-import Data.Monoid (All(..))
-import qualified Data.Map as Map
-import Control.Applicative
-import Control.Monad.Logic
+import           Free.Scoped         (FS (..), Inc (..), Sum (InL, InR),
+                                      transFS, traverseFS, type (:+:))
+import           Free.Scoped.TH      (makePatternsAll)
 
 trace :: String -> a -> a
--- trace = Debug.Trace.trace
-trace _ = id
+trace = Debug.Trace.trace
+-- trace _ = id
 
 -- * SOAS
 
@@ -66,7 +67,7 @@ instance Bifunctor sig => Bifunctor (Equation sig) where
   bimap f g (lhs :==: rhs) =
     transFS k (fmap g lhs) :==: transFS k (fmap g rhs)
     where
-      k (InL l) = InL l
+      k (InL l)                 = InL l
       k (InR (MetaVarF m args)) = InR (MetaVarF (f m) args)
 
 instance Bifoldable sig => Bifoldable (Equation sig) where
@@ -144,7 +145,7 @@ class ZipMatch sig where
 instance (ZipMatch f, ZipMatch g) => ZipMatch (Sum f g) where
   zipMatch (InL x) (InL y) = InL <$> zipMatch x y
   zipMatch (InR x) (InR y) = InR <$> zipMatch x y
-  zipMatch _ _ = Nothing
+  zipMatch _ _             = Nothing
 
 instance Eq metavar => ZipMatch (MetaF metavar) where
   zipMatch (MetaVarF x xs) (MetaVarF y ys)
@@ -170,7 +171,7 @@ closed2 :: Bitraversable sig => SOAS sig metavar var -> Maybe (SOAS sig metavar'
 closed2 = traverse (const Nothing) >=> traverseFS f
   where
     f (InR MetaVarF{}) = Nothing
-    f (InL x) = Just (InL x)
+    f (InL x)          = Just (InL x)
 
 closedSubst :: Bitraversable sig => MetaSubst sig metavar metavar' (Inc var) -> Maybe (MetaSubst sig metavar metavar' var)
 closedSubst = traverse (const Nothing)
@@ -181,8 +182,8 @@ checkSubst (MetaSubst ((m, body) : substs)) = do
   MetaSubst substs' <- checkSubst (MetaSubst substs)
   case lookup m substs' of
     Just body' | body == body' -> return (MetaSubst substs')
-    Nothing -> return (MetaSubst ((m, body) : substs'))
-    _ -> Nothing
+    Nothing                    -> return (MetaSubst ((m, body) : substs'))
+    _                          -> Nothing
 
 -- >>> matchMetaVar [AppE (Var "A") (M "N" [Var "B"]), Var "C"] [] (Var "C")
 -- [(Pure (BoundVar 1),MetaSubst {getMetaSubsts = []})]
@@ -215,8 +216,8 @@ matchMetaVar args boundVars rhs = projections ++ projectionsBoundVars ++ imitati
       ]
 
     k :: IncMany (Inc a) -> Inc (IncMany a)
-    k (BoundVar i) = S (BoundVar i)
-    k (FreeVar Z) = Z
+    k (BoundVar i)    = S (BoundVar i)
+    k (FreeVar Z)     = Z
     k (FreeVar (S x)) = S (FreeVar x)
 
     imitationsInL =
@@ -276,7 +277,7 @@ match lhs rhs =
     Pure x ->
       case rhs of
         Pure y | x == y -> return (MetaSubst [])
-        _ -> []
+        _               -> []
 
 addVarArgs :: Bifunctor sig => [var] -> SOAS sig metavar var -> SOAS sig metavar var
 addVarArgs vars = \case
@@ -316,10 +317,10 @@ applyRuleSomewhere (lhs :==: rhs) term = do
   return (applyMetaSubst (error "impossible happened!") subst rhs')
   where
     countBoundVar BoundVar{} = 1
-    countBoundVar _ = 0
+    countBoundVar _          = 0
     lhs' = M Z [transFS k lhs]
     rhs' = M Z [transFS k rhs]
-    k (InL l) = InL l
+    k (InL l)                 = InL l
     k (InR (MetaVarF m args)) = InR (MetaVarF (S m) args)
 
 whnfFromRules
@@ -374,7 +375,7 @@ whnfChainFromRules rules term
 -- * E-unification
 
 data Constraint sig metavar var = Constraint
-  { constraintEq :: Equation sig metavar (IncMany var)
+  { constraintEq    :: Equation sig metavar (IncMany var)
   , constraintScope :: Int
   } deriving (Functor)
 
@@ -410,7 +411,7 @@ decompose Constraint{constraintEq = Pure x :==: Pure y}
 decompose Constraint{constraintEq = Free lhs :==: Free rhs, ..} =
   case zipMatch lhs rhs of
     Nothing -> []
-    Just t -> [(mempty, bifoldMap mkConstraintScope mkConstraint t)]
+    Just t  -> [(mempty, bifoldMap mkConstraintScope mkConstraint t)]
   where
     mkConstraint (l, r) =
       [Constraint{constraintEq = l :==: r, ..}]
@@ -420,7 +421,7 @@ decompose Constraint{constraintEq = Free lhs :==: Free rhs, ..} =
         l' = fmap k l
         r' = fmap k r
         -- turn local variable into a new constraint forall variable
-        k Z = BoundVar constraintScope
+        k Z     = BoundVar constraintScope
         k (S x) = x
 decompose _ = []
 
@@ -484,7 +485,7 @@ eliminateMetaVar Constraint{constraintEq = lhs@(M m args) :==: rhs}
       ]
   where
     isVar Pure{} = True
-    isVar _ = False
+    isVar _      = False
     -- isConst = null . metavarsOf
     distinct xs = xs == nub xs
 eliminateMetaVar Constraint{constraintEq = lhs :==: rhs@(M m args), ..} =
@@ -528,7 +529,7 @@ refreshAllMetaVars :: (Bifunctor sig, Bifoldable sig, Eq metavar) => [metavar] -
 refreshAllMetaVars scopeMeta freshMetaVars term = transFS k term
   where
     k (InR (MetaVarF m args)) = InR (MetaVarF (rename m) args)
-    k (InL op) = InL op
+    k (InL op)                = InL op
 
     renamings = zip termMetaVars freshMetaVars'
     rename m = case lookup m renamings of
@@ -538,8 +539,8 @@ refreshAllMetaVars scopeMeta freshMetaVars term = transFS k term
     termMetaVars = nub (go term)
       where
         go :: Bifoldable sig => SOAS sig metavar var -> [metavar]
-        go Pure{} = []
-        go (Free (InL op)) = bifoldMap go go op
+        go Pure{}                         = []
+        go (Free (InL op))                = bifoldMap go go op
         go (Free (InR (MetaVarF m args))) = m : foldMap go args
 
 refreshAllMetaVarsEquation :: (Bifunctor sig, Bifoldable sig, Eq metavar) => [metavar] -> [metavar] -> Equation sig metavar var -> Equation sig metavar var
@@ -549,7 +550,7 @@ refreshAllMetaVarsEquation scopeMeta freshMetaVars (lhs :==: rhs) = lhs' :==: rh
     rhs' = transFS k rhs
 
     k (InR (MetaVarF m args)) = InR (MetaVarF (rename m) args)
-    k (InL op) = InL op
+    k (InL op)                = InL op
 
     renamings = zip eqMetaVars freshMetaVars'
     rename m = case lookup m renamings of
@@ -559,8 +560,8 @@ refreshAllMetaVarsEquation scopeMeta freshMetaVars (lhs :==: rhs) = lhs' :==: rh
     eqMetaVars = nub (foldMap go [lhs, rhs])
       where
         go :: Bifoldable sig => SOAS sig metavar var -> [metavar]
-        go Pure{} = []
-        go (Free (InL op)) = bifoldMap go go op
+        go Pure{}                         = []
+        go (Free (InL op))                = bifoldMap go go op
         go (Free (InR (MetaVarF m args))) = m : foldMap go args
 
 mutate' :: Ord metavar => [Equation sig metavar var] -> [metavar] -> [metavar] -> TransitionRule sig metavar var
@@ -620,21 +621,21 @@ mutateWith rule scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, 
     matchAxiomPart l r = return ([], [Constraint (l :==: r) constraintScope])
 
     k :: Inc (IncMany a) -> IncMany (Inc a)
-    k Z = FreeVar Z
+    k Z                = FreeVar Z
     k (S (BoundVar i)) = BoundVar i
-    k (S (FreeVar x)) = FreeVar (S x)
+    k (S (FreeVar x))  = FreeVar (S x)
 
     toBoundIndex (BoundVar i) = [i]
-    toBoundIndex _ = []
+    toBoundIndex _            = []
 
 extendConstraint :: Bifunctor sig => Constraint sig metavar (Inc var) -> Constraint sig metavar var
 extendConstraint Constraint{..} = Constraint
   { constraintEq = fmap k constraintEq
   , constraintScope = 1 + constraintScope}
   where
-    k (FreeVar Z) = BoundVar constraintScope
+    k (FreeVar Z)     = BoundVar constraintScope
     k (FreeVar (S x)) = FreeVar x
-    k (BoundVar i) = BoundVar i
+    k (BoundVar i)    = BoundVar i
 
 matchingRoots :: (Bifoldable sig, ZipMatch sig) => SOAS sig metavar var -> SOAS sig metavar var' -> Bool
 matchingRoots (Free (InL l)) (Free (InL r))
@@ -666,7 +667,7 @@ stuck constraint = [(mempty, [constraint])]
 
 onlyFreeVar :: IncMany var -> [var]
 onlyFreeVar (FreeVar x) = [x]
-onlyFreeVar BoundVar{} = []
+onlyFreeVar BoundVar{}  = []
 
 choose :: [a] -> [(a, [a])]
 choose xs =
@@ -677,14 +678,14 @@ choose xs =
 
 orElse :: [a] -> [a] -> [a]
 orElse [] ys = ys
-orElse xs _ = xs
+orElse xs _  = xs
 
 fromList :: MonadLogic logic => [a] -> logic a
-fromList [] = empty
+fromList []     = empty
 fromList (x:xs) = pure x <|> fromList xs
 
 fromListFair :: MonadLogic logic => [a] -> logic a
-fromListFair [] = empty
+fromListFair []     = empty
 fromListFair (x:xs) = pure x `interleave` fromList xs
 
 searchWith
@@ -983,7 +984,7 @@ ppLambdaE = go id
         withScope f = case freshVars of
           [] -> error "not enough fresh variables"
           z:zs ->
-            let varName' Z = z
+            let varName' Z     = z
                 varName' (S x) = varName x
             in f z zs varName'
 

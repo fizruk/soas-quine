@@ -113,18 +113,19 @@ eval (cons (symbol ("list"), cons(A[], cons(B[], nil))))
 lispEvalRules :: [Equation LispF String var]
 lispEvalRules =
   [  --EvalE NilE :==: NilE
-    EvalE (ConsE (SymbolE "quote") (ConsE (M "M" []) NilE)) :==: M "M" []
+    -- EvalE (ConsE (SymbolE "quote") (ConsE (M "M" []) NilE)) :==: M "M" []
   -- , EvalE (ConsE (SymbolE "list") NilE) :==: NilE
   -- , EvalE (ConsE (SymbolE "list") (ConsE (M "A" []) NilE)) :==: ConsE (M "A" []) NilE
-  , EvalE (ConsE (SymbolE "list") (ConsE (M "A" []) (ConsE (M "B" []) NilE))) :==: ConsE (M "A" []) (ConsE (M "B" []) NilE)
+   EvalE (ConsE (SymbolE "list") (ConsE (M "A" []) (ConsE (M "B" []) NilE))) :==: ConsE (M "A" []) (ConsE (M "B" []) NilE)
   , EvalE (ConsE (LambdaE (M "B" [Var Z])) (ConsE (M "A" []) NilE)) :==: EvalE (M "B" [M "A" []])
+  -- , EvalE (ConsE (ConsE (M "A" []) (M "B" [])) (M "C" [])) :==: EvalE (ConsE (EvalE (ConsE (M "A" []) (M "B" []))) (M "C" []))
   ]
 
 solveQuine :: (Eq var, Show var) => [SOAS LispF String (IncMany var)]
 solveQuine =
   [ body
   | (MetaSubst subst, _unsolved) <- defaultPreunify (15, 3) lispEvalRules
-      [Constraint{ constraintEq = e, constraintScope = 2}]
+      [Constraint{ constraintEq = e, constraintScope = 0}]
   , Just body <- [lookup "QUINE" subst]
   ]
   where
@@ -183,3 +184,28 @@ solveQuine =
 
     e = EvalE q :==: q
     q = M "QUINE" []
+
+solveList2 :: (Eq var, Show var) => [SOAS LispF String (IncMany var)]
+solveList2 =
+  [ body
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (15, 4) lispEvalRules
+      [Constraint{ constraintEq = e, constraintScope = 2}]
+  , Just body <- [lookup "LIST" subst]
+  ]
+  where
+    e = EvalE (ConsE (ConsE f m1) m2) :==: ConsE m1 (ConsE m2 NilE)
+    f = M "LIST" []
+    m1 = Var (BoundVar 0)
+    m2 = Var (BoundVar 1)
+
+solveDup :: (Eq var, Show var) => [SOAS LispF String (IncMany var)]
+solveDup =
+  [ body
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (15, 2) lispEvalRules
+      [Constraint{ constraintEq = e, constraintScope = 1}]
+  , Just body <- [lookup "DUP" subst]
+  ]
+  where
+    e = EvalE (ConsE f (ConsE x NilE)) :==: ConsE x (ConsE x NilE)
+    f = M "DUP" []
+    x = Var (BoundVar 0)
