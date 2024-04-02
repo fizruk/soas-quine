@@ -473,9 +473,8 @@ projectImitate scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: M m ar
   projectImitate' scopeMeta freshMetaVars (m, args) lhs constraintScope
 projectImitate _ _ _ = []
 
-eliminateMetaVar :: TransitionRule sig metavar var
-eliminateMetaVar Constraint{constraintEq = M{} :==: M{}} = []
-eliminateMetaVar Constraint{constraintEq = lhs@(M m args) :==: rhs}
+eliminateMetaVarL :: TransitionRule sig metavar var
+eliminateMetaVarL Constraint{constraintEq = lhs@(M m args) :==: rhs}
   | and
     [ all isVar args  -- TODO: maybe isConst is enough?
     , distinct args   -- TODO: do we need this?
@@ -491,10 +490,11 @@ eliminateMetaVar Constraint{constraintEq = lhs@(M m args) :==: rhs}
     isVar _      = False
     -- isConst = null . metavarsOf
     distinct xs = xs == nub xs
-eliminateMetaVar Constraint{constraintEq = lhs :==: rhs@(M m args), ..} =
-  eliminateMetaVar Constraint{constraintEq = rhs :==: lhs, ..}
-eliminateMetaVar _ = []
+eliminateMetaVarL _ = []
 
+eliminateMetaVar :: TransitionRule sig metavar var
+eliminateMetaVar c@Constraint{constraintEq = lhs :==: rhs} =
+  eliminateMetaVarL c `orElse` eliminateMetaVarL c{constraintEq = rhs :==: lhs}
 
 -- forall k. (λ x. k M6[x, k]) M3[k] =?= M6[M3[k],k]
 imitate :: [metavar] -> [metavar] -> TransitionRule sig metavar var
