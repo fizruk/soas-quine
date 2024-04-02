@@ -26,7 +26,7 @@ import           Data.Bifoldable     (Bifoldable (bifold, bifoldMap))
 import           Data.Bifunctor      (Bifunctor (bimap, first, second))
 
 import           Control.Applicative
-import           Control.Monad       (guard, (>=>))
+import           Control.Monad       (guard, when, (>=>))
 import           Control.Monad.Logic
 import           Control.Monad.State hiding (state)
 import           Data.Bifunctor.TH   (deriveBifoldable, deriveBifunctor,
@@ -79,7 +79,7 @@ instance Bifoldable sig => Bifoldable (Equation sig) where
       go h k (Free (InR (MetaVarF m args))) = h m <> foldMap (go h k) args
 
 deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term), Eq var, Eq metavar) => Eq (Equation sig metavar var)
-deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Equation sig metavar var)
+-- deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Equation sig metavar var)
 
 pattern M :: metavar -> [SOAS sig metavar var] -> SOAS sig metavar var
 pattern M m args = Free (InR (MetaVarF m args))
@@ -87,14 +87,17 @@ pattern M m args = Free (InR (MetaVarF m args))
 data IncMany var
   = BoundVar Int -- bound variable
   | FreeVar var
-  deriving (Eq, Show, Functor, Foldable, Traversable)
+  deriving (Eq, Functor, Foldable, Traversable)
 
+instance Show var => Show (IncMany var) where
+  show (BoundVar i) = "_b" <> show i
+  show (FreeVar x)  = show x
 newtype MetaSubst sig metavar metavar' var
   = MetaSubst { getMetaSubsts :: [(metavar, SOAS sig metavar' (IncMany var))] }
   deriving (Functor, Foldable, Traversable, Semigroup, Monoid)
 
 deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term), Eq var, Eq metavar, Eq metavar') => Eq (MetaSubst sig metavar metavar' var)
-deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar, Show metavar') => Show (MetaSubst sig metavar metavar' var)
+-- deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar, Show metavar') => Show (MetaSubst sig metavar metavar' var)
 
 applyMetaSubst :: (Eq metavar, Bifunctor sig)
   => (metavar -> metavar') -> MetaSubst sig metavar metavar' var -> SOAS sig metavar var -> SOAS sig metavar' var
@@ -386,7 +389,7 @@ instance Bifoldable sig => Bifoldable (Constraint sig) where
   bifoldMap f g Constraint{..} = bifoldMap f (foldMap g) constraintEq
 
 deriving instance (forall scope term. (Eq scope, Eq term) => Eq (sig scope term), Eq var, Eq metavar) => Eq (Constraint sig metavar var)
-deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Constraint sig metavar var)
+-- deriving instance (forall scope term. (Show scope, Show term) => Show (sig scope term), Show var, Show metavar) => Show (Constraint sig metavar var)
 
 data Constraint' sig metavar var
   = SOAS sig metavar var :=?=: SOAS sig metavar var
@@ -640,7 +643,8 @@ extendConstraint Constraint{..} = Constraint
 matchingRoots :: (Bifoldable sig, ZipMatch sig) => SOAS sig metavar var -> SOAS sig metavar var' -> Bool
 matchingRoots (Free (InL l)) (Free (InL r))
   | Just lr <- zipMatch l r = getAll (bifoldMap (All . uncurry matchingRoots) (All . uncurry matchingRoots) lr)
-matchingRoots (Free InL{}) (Free InR{}) = True
+matchingRoots _ (Free InR{}) = True
+matchingRoots (Free InR{}) _ = True
 matchingRoots _ _ = False
 
 mutate :: [Equation sig metavar var] -> [metavar] -> [metavar] -> TransitionRule sig metavar var
@@ -660,6 +664,25 @@ mutate rules scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..}
         return (mempty,
           [ Constraint{constraintEq = rhs :==: ruleLHS, ..}
           , Constraint{constraintEq = ruleRHS :==: lhs, ..} ])
+    ]
+
+mutateDirected :: [Equation sig metavar var] -> [metavar] -> [metavar] -> TransitionRule sig metavar var
+mutateDirected rules scopeMeta freshMetaVars Constraint{constraintEq = lhs :==: rhs, ..} = do
+  rule@(lhsOrig :==: rhsOrig) <- rules
+  let refreshedRule = refreshAllMetaVarsEquation scopeMeta freshMetaVars rule
+  let instantiatedRule = addVarArgsEquation [BoundVar i | i <- [0 .. constraintScope - 1]] (FreeVar <$> refreshedRule)
+  let ruleLHS :==: ruleRHS = instantiatedRule
+  concat
+    [ do
+        guard (matchingRoots lhsOrig lhs || matchingRoots rhsOrig rhs)
+        return (mempty,
+          [ Constraint{constraintEq = lhs :==: ruleLHS, ..}
+          , Constraint{constraintEq = ruleRHS :==: rhs, ..} ])
+    -- , do
+    --     guard (matchingRoots lhsOrig rhs || matchingRoots rhsOrig lhs)
+    --     return (mempty,
+    --       [ Constraint{constraintEq = rhs :==: ruleLHS, ..}
+    --       , Constraint{constraintEq = ruleRHS :==: lhs, ..} ])
     ]
 
 stuck :: TransitionRule sig metavar var
@@ -718,22 +741,39 @@ searchWith = go 0
           -- remove "dead" rules
           let liveRuleGroups = map (filter ((`notElem` deadRules) . fst)) rules
 
+          let allBranchesByGroup =
+                [ sortOn (length . take 3)  -- prioritise non-branching rules
+                    [ [ (name, (i, x), y, map snd xs')
+                      | (name, rule) <- liveRules
+                      , y <- rule state x -- `orElse` trace (replicate depth ' ' <> "- FAIL (" <> name <> ") for " <> show x) []
+                      ]
+                    | ((i, x), xs') <- choose (zip [0..] xs) ]
+                | liveRules <- liveRuleGroups ]
+
+          let deadEnds =
+                [ x
+                | (i, x) <- zip [0..] xs
+                , null
+                    [ branch
+                    | branches <- allBranchesByGroup
+                    , branch <- branches
+                    , (_, (j, _), _, _) <- branch
+                    , i == j ]
+                ]
+          when (not (null deadEnds)) $
+            trace (replicate depth ' ' <> " ××× DEAD END!") $ return ()
+          guard (null deadEnds)
+
           branches <- -- branch only using rules for the first priority group with any transitions
             once $ fromList $ dropWhile (all null)
-              [ sortOn (length . take 3)  -- prioritise non-branching rules
-                  [ [ (name, x, y, xs')
-                    | (name, rule) <- liveRules
-                    , y <- rule state x -- `orElse` trace (replicate depth ' ' <> "- FAIL (" <> name <> ") for " <> show x) []
-                    ]
-                  | (x, xs') <- choose xs ]
-              | liveRules <- liveRuleGroups ]
+              allBranchesByGroup
 
           -- should this be enabled?
           -- guard $ not (any null branches)
 
           branch <- fromList branches
           let selectBranch = do
-                (name, x, (_priority, (state', (m, ys))), xs') <- fromListFair $
+                (name, (_, x), (_priority, (state', (m, ys))), xs') <- fromListFair $
                   sortOn (\(_, _, (priority, _), _) -> priority)
                     branch
                 -- follow hints, if provided
@@ -764,6 +804,8 @@ updateAt k f ((k', v) : kvs)
 defaultPreunify
   :: (Matchable sig, Eq var
   , forall scope term. (Show scope, Show term) => Show (sig scope term)
+  , forall var. (Show var) => Show (Constraint sig String var)
+  , forall var. (Show var) => Show (MetaSubst sig String String var)
   , Show var)
   => (Int, Int)
   -> [Equation sig String var]
@@ -780,6 +822,8 @@ defaultPreunify (maxDepth, maxMutate) rules constraints = nub $
 defaultGuidedPreunify
   :: (Matchable sig, Eq var
   , forall scope term. (Show scope, Show term) => Show (sig scope term)
+  , forall var. (Show var) => Show (Constraint sig String var)
+  , forall var. (Show var) => Show (MetaSubst sig String String var)
   , Show var)
   => [String]
   -> (Int, Int)
@@ -796,6 +840,8 @@ defaultGuidedPreunify guide (maxDepth, maxMutate) rules constraints = nub $ obse
 preunify
   :: (Matchable sig, Ord metavar, Eq var
   , forall scope term. (Show scope, Show term) => Show (sig scope term)
+  , forall var. (Show var) => Show (Constraint sig metavar var)
+  , forall var. (Show var) => Show (MetaSubst sig metavar metavar var)
   , Show var, Show metavar
   , MonadLogic logic)
   => [String]
@@ -828,7 +874,7 @@ preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints 
         -- , ("eliminate*", stateless eliminateMetaVar)
         , ("imitate", auto imitate)
         , ("project", stateless project)
-        , ("mutate", auto (mutate' axioms))
+        , ("mutate", auto (mutate axioms))
         ]
       ]
 
