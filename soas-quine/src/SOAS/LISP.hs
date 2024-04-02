@@ -50,6 +50,12 @@ instance {-# OVERLAPPING #-} Show var => Show (LispE String var) where
 instance {-# OVERLAPPING #-} Show var => Show (Equation LispF String var) where
   show (lhs :==: rhs) = show lhs <> " :==: " <> show rhs
 
+instance {-# OVERLAPPING #-} Show var => Show (MetaSubst LispF String String var) where
+  show (MetaSubst substs) = show substs
+
+instance {-# OVERLAPPING #-} Show var => Show (Constraint LispF String var) where
+  show (Constraint (lhs :==: rhs) n) = "∀" <> show n <> ". " <> show lhs <> " :=?=: " <> show rhs
+
 ppLispE :: [String] -> LispE String String -> String
 ppLispE = go id
   where
