@@ -28,6 +28,7 @@ library
       Free.Scoped
       Free.Scoped.TH
       Lib
+      SOAS.LISP
       SOAS.Quine
   other-modules:
       Paths_soas_quine

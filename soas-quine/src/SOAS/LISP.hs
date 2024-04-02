@@ -1,20 +1,20 @@
-{-# LANGUAGE QuantifiedConstraints #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DeriveTraversable          #-}
+{-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE PatternSynonyms            #-}
+{-# LANGUAGE QuantifiedConstraints      #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StandaloneDeriving         #-}
+{-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE TypeOperators              #-}
+{-# LANGUAGE UndecidableInstances       #-}
 {-# OPTIONS_GHC -Wno-simplifiable-class-constraints #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ParallelListComp #-}
-{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE MultiWayIf                 #-}
+{-# LANGUAGE ParallelListComp           #-}
+{-# LANGUAGE RecordWildCards            #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use &&" #-}
 {-# HLINT ignore "Use ++" #-}
@@ -22,12 +22,13 @@
 {-# OPTIONS_GHC -Wno-type-defaults #-}
 module SOAS.LISP where
 
-import Free.Scoped
-import Free.Scoped.TH ( makePatternsAll )
-import Data.Bifunctor.TH
-    ( deriveBifoldable, deriveBifunctor, deriveBitraversable )
+import           Data.Bifunctor.TH (deriveBifoldable, deriveBifunctor,
+                                    deriveBitraversable)
+import           Data.List         (intercalate)
+import           Free.Scoped
+import           Free.Scoped.TH    (makePatternsAll)
 
-import SOAS.Quine
+import           SOAS.Quine
 
 data LispF scope term
   = NilF
@@ -41,9 +42,49 @@ deriveBifoldable ''LispF
 deriveBitraversable ''LispF
 makePatternsAll ''LispF
 
+instance {-# OVERLAPPING #-} Show var => Show (LispE String var) where
+  show = ppLispE defaultVars . fmap show
+    where
+      defaultVars = [ "x" <> show n | n <- [1..] ]
+
+instance {-# OVERLAPPING #-} Show var => Show (Equation LispF String var) where
+  show (lhs :==: rhs) = show lhs <> " :==: " <> show rhs
+
+ppLispE :: [String] -> LispE String String -> String
+ppLispE = go id
+  where
+    ppArgs :: (var -> String) -> [String] -> LispE String var -> String
+    ppArgs varName freshVars = \case
+      Free (InL (ConsF arg (Free (InL NilF)))) ->
+        " " ++ go varName freshVars arg
+      Free (InL (ConsF arg args@(Free (InL ConsF{})))) ->
+        " " ++ go varName freshVars arg ++ ppArgs varName freshVars args
+      Free (InL (ConsF arg args)) ->
+        " " ++ go varName freshVars arg ++ ppArgs varName freshVars args
+      Free (InL NilF) -> ""
+      arg -> " . " ++ go varName freshVars arg
+
+    go :: (var -> String) -> [String] -> LispE String var -> String
+    go varName freshVars = \case
+      Pure x -> varName x
+      Free (InR (MetaVarF m args)) -> m ++ "[" ++ intercalate "," (map (go varName freshVars) args) ++  "]"
+      Free (InL NilF) -> "()"
+      Free (InL (ConsF fun args)) ->
+        "(" ++ go varName freshVars fun ++ ppArgs varName freshVars args ++ ")"
+      Free (InL (LambdaF body)) -> withScope $ \ z zs varName' ->
+        "(lambda (" ++ z ++ ") " ++ go varName' zs body ++ ")"
+      Free (InL (EvalF e)) -> "(eval " ++ go varName freshVars e ++ ")"
+      Free (InL (SymbolF sym)) -> sym
+      where
+        withScope f = case freshVars of
+          [] -> error "not enough fresh variables"
+          z:zs ->
+            let varName' Z     = z
+                varName' (S x) = varName x
+            in f z zs varName'
+
 type Lisp = FS LispF
 type LispE metavar var = SOAS LispF metavar var
-
 instance ZipMatch LispF where
   zipMatch NilF NilF
     = Just NilF
@@ -71,20 +112,20 @@ eval (cons (symbol ("list"), cons(A[], cons(B[], nil))))
 -}
 lispEvalRules :: [Equation LispF String var]
 lispEvalRules =
-  [ EvalE NilE :==: NilE
-  , EvalE (ConsE (SymbolE "quote") (ConsE (M "M" []) NilE)) :==: M "M" []
-  , EvalE (ConsE (LambdaE (M "B" [Var Z])) (ConsE (M "A" []) NilE)) :==: EvalE (M "B" [M "A" []])
-  , EvalE (ConsE (SymbolE "list") NilE) :==: NilE
-  , EvalE (ConsE (SymbolE "list") (ConsE (M "A" []) NilE)) :==: ConsE (M "A" []) NilE
+  [  --EvalE NilE :==: NilE
+    EvalE (ConsE (SymbolE "quote") (ConsE (M "M" []) NilE)) :==: M "M" []
+  -- , EvalE (ConsE (SymbolE "list") NilE) :==: NilE
+  -- , EvalE (ConsE (SymbolE "list") (ConsE (M "A" []) NilE)) :==: ConsE (M "A" []) NilE
   , EvalE (ConsE (SymbolE "list") (ConsE (M "A" []) (ConsE (M "B" []) NilE))) :==: ConsE (M "A" []) (ConsE (M "B" []) NilE)
+  , EvalE (ConsE (LambdaE (M "B" [Var Z])) (ConsE (M "A" []) NilE)) :==: EvalE (M "B" [M "A" []])
   ]
 
 solveQuine :: (Eq var, Show var) => [SOAS LispF String (IncMany var)]
 solveQuine =
   [ body
-  | (MetaSubst subst, _unsolved) <- defaultPreunify (9, 3) lispEvalRules
+  | (MetaSubst subst, _unsolved) <- defaultPreunify (15, 3) lispEvalRules
       [Constraint{ constraintEq = e, constraintScope = 2}]
-  , Just body <- [lookup "CONST" subst]
+  , Just body <- [lookup "QUINE" subst]
   ]
   where
     -- QUINE := (λ x. M1[x]) : M2[] : nil
