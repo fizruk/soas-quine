@@ -874,7 +874,7 @@ preunify hints (maxDepth, maxMutate) scopeMeta freshMetaVars axioms constraints 
         -- , ("eliminate*", stateless eliminateMetaVar)
         , ("imitate", auto imitate)
         , ("project", stateless project)
-        , ("mutate", auto (mutate axioms))
+        , ("mutate", auto (mutateDirected axioms))
         ]
       ]
 
