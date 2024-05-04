@@ -42,6 +42,12 @@ To (re)build the project and run the default entry point, simply use
 stack run
 ```
 
+It may output debug information about the search tree (for the non-deterministic unification procedure), which you may ignore by redirecting output to `/dev/null`:
+
+```sh
+stack run 2>/dev/null
+```
+
 You may want to comment/uncomment sample unification problems in [`Main.hs`](soas-quine/app/Main.hs) for different sample runs.
 
 More documentation may come in the future!
