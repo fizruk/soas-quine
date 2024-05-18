@@ -982,6 +982,65 @@ defaultFreshMetaVars = [ "m" <> show n | n <- [0..]]
 --         _ opLR
 --   _ -> []
 
+
+-- * Conditional Second-Order rewriting
+
+data Condition sig metavar var
+  = RewritesTo (SOAS sig metavar (IncMany var)) (SOAS sig metavar (IncMany var))
+  -- | RewritesToClosure (SOAS sig metavar var) (SOAS sig metavar var)
+  | Empty
+  deriving (Functor, Foldable)
+
+
+-- Current assumptions/limitations:
+-- * Condition LHS has to contain metavariables from the equation LHS
+data ConditionalEquation sig metavar var
+  = Condition sig metavar var :=>: Equation sig metavar var
+  deriving (Functor, Foldable)
+
+infix 5 :=>:
+
+addVarArgsConditionalEquation
+  :: Bifunctor sig
+  => [var]
+  -> ConditionalEquation sig metavar var
+  -> ConditionalEquation sig metavar var
+addVarArgsConditionalEquation vars (cond :=>: equation) = cond' :=>: equation'
+  where
+    cond' = case cond of
+      Empty -> Empty
+      RewritesTo lhs rhs -> let add = addVarArgs (FreeVar <$> vars) in
+        RewritesTo (add lhs) (add rhs)
+    equation' = addVarArgsEquation vars equation
+
+applyConditionalRule
+  :: (Matchable sig, Eq metavar, Eq metavar', Eq var)
+  => ConditionalEquation sig metavar var
+  -> [ConditionalEquation sig metavar var]
+  -> (metavar -> metavar')
+  -> SOAS sig metavar' var
+  -> [SOAS sig metavar' var]
+applyConditionalRule (RewritesTo cLhs cRhs :=>: lhs :==: rhs) allRules rename term = do
+  subst <- match lhs term -- MetaSubst sig m m' var
+  -- let subst' = fmap FreeVar subst
+  -- 1. apply subst at condition lhs and rhs
+  let cLhs' = applyMetaSubst rename (fmap FreeVar subst) cLhs -- SOAS sig m' (IncMany var)
+  let cRhs' = applyMetaSubst rename (fmap FreeVar subst) cRhs -- SOAS sig m' (IncMany var)
+  let vars = foldr (:) [] cLhs'
+  -- 2. make single-step reductions for the resulting term
+  rule' <- map (addVarArgsConditionalEquation vars) allRules' -- ConditionalEquation sig m (IncMany var)
+  newX <- applyConditionalRule rule' allRules' rename cLhs' -- SOAS sig m' (IncMany var)
+  -- 3. match condition rhs to the resulting terms
+  newSubst <- match cRhs newX -- MetaSubst sig m m' (IncMany var)
+  return $ fmap f $ applyMetaSubst rename (fmap FreeVar subst <> newSubst) rhs'
+  where
+    allRules' = map (fmap FreeVar) allRules
+    rhs' = fmap FreeVar rhs
+    f (BoundVar _) = error "assumption failed!"
+    f (FreeVar x)  = x
+applyConditionalRule (Empty :=>: rule) allRules rename term = applyRule rule term
+
+
 -- * Example (untyped lambda calculus)
 
 data LambdaF scope term
@@ -1067,6 +1126,24 @@ beta = AppE (LamE (M "M" [Var Z])) (M "N" []) :==: M "M" [M "N" []]
 -- (\ z. M[z]) N[] = M[N[]]
 eta :: Equation LambdaF String var
 eta = LamE (AppE (M "M" []) (Var Z)) :==: M "M" []
+
+-- ??? How do I make variable free in the condition?
+-- to consider:
+-- lamCongr = RewritesTo (M "M" [Var "x"]) (M "N" [Var "x"]) -- meh
+-- lamCongr = RewritesTo (M "M" [M "T" []]) (M "N" [M "T" []])
+-- 
+lamCongr :: ConditionalEquation LambdaF String var
+lamCongr = (RewritesTo (M "M" [Var $ BoundVar 0]) (M "N" [Var $ BoundVar 0]))
+  :=>: (LamE (M "M" [Var Z]) :==: LamE (M "N" [Var Z]))
+
+conditionalRules :: [ConditionalEquation LambdaF String var]
+conditionalRules = [lamCongr, Empty :=>: beta]
+
+testTerm :: LambdaE String String
+testTerm = LamE (AppE two (Var Z))
+
+testConditional :: [SOAS LambdaF String String]
+testConditional = applyConditionalRule lamCongr conditionalRules id testTerm
 
 -- (\ s. \z. s (s z)) f
 -- M[z'] := \z. z' (z' z)
